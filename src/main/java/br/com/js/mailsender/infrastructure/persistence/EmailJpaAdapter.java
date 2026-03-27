@@ -1,11 +1,14 @@
 package br.com.js.mailsender.infrastructure.persistence;
 
 import br.com.js.mailsender.domain.model.Email;
+import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
 import br.com.js.mailsender.domain.ports.EmailRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -28,34 +31,46 @@ public class EmailJpaAdapter implements EmailRepository {
     }
 
     private EmailJpaEntity toEntity(EmailMessage domain) {
-        return new EmailJpaEntity(
+        EmailJpaEntity entity = new EmailJpaEntity(
                 domain.getId(),
                 domain.getTo().value(),
                 domain.getSubject(),
                 domain.getBody(),
+                domain.isHtml(),
                 domain.getStatus(),
+                new ArrayList<>(),
                 domain.getCreatedAt(),
                 domain.getSentAt());
+
+        if (domain.getAttachments() != null) {
+            List<EmailAttachmentJpaEntity> attachmentEntities = domain.getAttachments().stream()
+                    .map(att -> {
+                        EmailAttachmentJpaEntity attEntity = new EmailAttachmentJpaEntity();
+                        attEntity.setName(att.name());
+                        attEntity.setContentType(att.contentType());
+                        attEntity.setEmail(entity);
+                        return attEntity;
+                    })
+                    .toList();
+            entity.getAttachments().addAll(attachmentEntities);
+        }
+
+        return entity;
     }
 
     private EmailMessage toDomain(EmailJpaEntity entity) {
-        // Using reflection or a constructor/builder to reconstruct domain object
-        // Since EmailMessage constructor is private, we should probably add a
-        // reconstruction factory method in EmailMessage
-        // But for this exercise I'll modify EmailMessage to allow reconstruction or
-        // assume we can add a method there.
-        // Let's add 'reconstitute' method to EmailMessage using replace tool in next
-        // step if generic 'create' is not enough.
-        // Actually, I can just cheat slightly and make the fields non-final or add a
-        // reconstruction constructor package-private
-        // But the Clean way is a static factory 'reconstitute'.
-        // For now, I will use a trick:
-        // I will assume I can update EmailMessage.java to add a reconstitution method.
+        List<EmailAttachment> attachments = entity.getAttachments() != null ?
+                entity.getAttachments().stream()
+                        .map(attEntity -> new EmailAttachment(attEntity.getName(), attEntity.getContentType(), null))
+                        .toList() : new ArrayList<>();
+
         return EmailMessage.reconstitute(
                 entity.getId(),
                 Email.of(entity.getRecipient()),
                 entity.getSubject(),
                 entity.getBody(),
+                entity.isHtml(),
+                attachments,
                 entity.getStatus(),
                 entity.getCreatedAt(),
                 entity.getSentAt());

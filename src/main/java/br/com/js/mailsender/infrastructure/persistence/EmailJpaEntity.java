@@ -9,6 +9,8 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 @Entity
@@ -30,8 +32,14 @@ public class EmailJpaEntity {
     @Column(columnDefinition = "TEXT")
     private String body;
 
+    @Column(name = "is_html")
+    private boolean isHtml;
+
     @Enumerated(EnumType.STRING)
     private EmailStatus status;
+
+    @OneToMany(mappedBy = "email", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<EmailAttachmentJpaEntity> attachments = new ArrayList<>();
 
     private Instant createdAt;
     private Instant sentAt;

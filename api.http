@@ -1,0 +1,80 @@
+### 1. Enviar e-mail de teste simples (Sem HTML e sem anexos)
+POST http://localhost:8080/api/v1/emails
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="to"
+
+jaymesanches@gmail.com
+--WebAppBoundary
+Content-Disposition: form-data; name="subject"
+
+Teste de Envio Simples
+--WebAppBoundary
+Content-Disposition: form-data; name="body"
+
+Olá! Este é um e-mail simples (texto plano) enviado via multipart/form-data.
+--WebAppBoundary--
+
+
+### 2. Enviar e-mail formatado em HTML
+POST http://localhost:8080/api/v1/emails
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="to"
+
+jaymesanches@gmail.com
+--WebAppBoundary
+Content-Disposition: form-data; name="subject"
+
+Teste de E-mail HTML
+--WebAppBoundary
+Content-Disposition: form-data; name="isHtml"
+
+true
+--WebAppBoundary
+Content-Disposition: form-data; name="body"
+
+<div style="font-family: Arial, sans-serif;">
+  <h1>Olá, Jayme!</h1>
+  <p>Este é um teste de mensagem contendo tags <strong>HTML</strong>.</p>
+  <p style="color: blue;">Texto azul para testar a formatação!</p>
+</div>
+--WebAppBoundary--
+
+
+### 3. Enviar e-mail com HTML e múltiplos anexos inline
+POST http://localhost:8080/api/v1/emails
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="to"
+
+jaymesanches@gmail.com
+--WebAppBoundary
+Content-Disposition: form-data; name="subject"
+
+Teste com Múltiplos Anexos
+--WebAppBoundary
+Content-Disposition: form-data; name="isHtml"
+
+true
+--WebAppBoundary
+Content-Disposition: form-data; name="body"
+
+<h3>E-mail com Anexos</h3>
+<p>Por favor, verifique os relatórios de teste em anexo.</p>
+--WebAppBoundary
+Content-Disposition: form-data; name="attachments"; filename="documento_teste.txt"
+Content-Type: text/plain
+
+Conteúdo do documento de texto anexado pelo arquivo api.http. Funciona super bem!
+--WebAppBoundary
+Content-Disposition: form-data; name="attachments"; filename="dados.csv"
+Content-Type: text/csv
+
+id,nome,cargo
+1,Jayme,Dev
+2,Fulano,QA
+--WebAppBoundary--
