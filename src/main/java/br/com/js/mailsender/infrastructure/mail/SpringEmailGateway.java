@@ -31,15 +31,15 @@ public class SpringEmailGateway implements EmailGateway {
 
             if (hasAttachments) {
                 for (var attachment : emailMessage.getAttachments()) {
-                    if (attachment.content() != null && attachment.content().length > 0) {
-                        helper.addAttachment(attachment.name(), new ByteArrayResource(attachment.content()) {
+                    if (attachment.getContent() != null && attachment.getContent().length > 0) {
+                        helper.addAttachment(attachment.getName(), new ByteArrayResource(attachment.getContent()) {
                             @Override
                             public String getFilename() {
-                                return attachment.name();
+                                return attachment.getName();
                             }
                         });
                     } else {
-                        log.warn("Attachment {} has no content to send", attachment.name());
+                        log.warn("Attachment {} has no content to send", attachment.getName());
                     }
                 }
             }

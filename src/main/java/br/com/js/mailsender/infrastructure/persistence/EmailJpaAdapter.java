@@ -46,8 +46,9 @@ public class EmailJpaAdapter implements EmailRepository {
             List<EmailAttachmentJpaEntity> attachmentEntities = domain.getAttachments().stream()
                     .map(att -> {
                         EmailAttachmentJpaEntity attEntity = new EmailAttachmentJpaEntity();
-                        attEntity.setName(att.name());
-                        attEntity.setContentType(att.contentType());
+                        attEntity.setName(att.getName());
+                        attEntity.setContentType(att.getContentType());
+                        attEntity.setStoragePath(att.getStoragePath());
                         attEntity.setEmail(entity);
                         return attEntity;
                     })
@@ -61,7 +62,10 @@ public class EmailJpaAdapter implements EmailRepository {
     private EmailMessage toDomain(EmailJpaEntity entity) {
         List<EmailAttachment> attachments = entity.getAttachments() != null ?
                 entity.getAttachments().stream()
-                        .map(attEntity -> new EmailAttachment(attEntity.getName(), attEntity.getContentType(), null))
+                        .map(attEntity -> EmailAttachment.fromStorage(
+                                attEntity.getName(), 
+                                attEntity.getContentType(), 
+                                attEntity.getStoragePath()))
                         .toList() : new ArrayList<>();
 
         return EmailMessage.reconstitute(

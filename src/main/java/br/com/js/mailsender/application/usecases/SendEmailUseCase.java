@@ -5,15 +5,18 @@ import br.com.js.mailsender.application.dtos.SendEmailRequest;
 import br.com.js.mailsender.domain.model.Email;
 import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
-import br.com.js.mailsender.domain.ports.EmailGateway;
+import br.com.js.mailsender.domain.ports.AttachmentStorageGateway;
 import br.com.js.mailsender.domain.ports.EmailRepository;
+import br.com.js.mailsender.infrastructure.messaging.EmailEnqueuedEvent;
+import br.com.js.mailsender.infrastructure.messaging.RabbitMQConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
 import java.util.Collections;
+import java.util.List;
 
 @Service
 @RequiredArgsConstructor
@@ -21,11 +24,12 @@ import java.util.Collections;
 public class SendEmailUseCase {
 
     private final EmailRepository emailRepository;
-    private final EmailGateway emailGateway;
+    private final AttachmentStorageGateway storageGateway;
+    private final RabbitTemplate rabbitTemplate;
 
     @Transactional
     public EmailResponse execute(SendEmailRequest request) {
-        log.info("Processing email request to: {}", request.to());
+        log.info("Enqueuing email request to: {}", request.to());
 
         var emailTo = Email.of(request.to());
         
@@ -34,7 +38,7 @@ public class SendEmailUseCase {
             attachments = request.attachments().stream()
                 .map(file -> {
                     try {
-                        return new EmailAttachment(file.getOriginalFilename(), file.getContentType(), file.getBytes());
+                        return EmailAttachment.fromUpload(file.getOriginalFilename(), file.getContentType(), file.getBytes());
                     } catch (Exception e) {
                         throw new RuntimeException("Failed to read attachment content", e);
                     }
@@ -43,26 +47,23 @@ public class SendEmailUseCase {
         }
 
         boolean isHtml = request.isHtml() != null ? request.isHtml() : false;
-        
         var emailMessage = EmailMessage.create(emailTo, request.subject(), request.body(), isHtml, attachments);
 
-        // Fazemos o primeiro save do status PENDING.
-        // Diferente do que ocorria, não sobrescrevemos a var emailMessage com o retorno
-        // pois como optamos por não salvar os bytes dos anexos no banco,
-        // o retorno do save (reconstitute) voltaria sem os bytes em memória!
-        emailRepository.save(emailMessage);
-
-        try {
-            // Utilizamos a intent original que AINDA possuí os binários dos anexos
-            emailGateway.send(emailMessage);
-            emailMessage.markAsSent();
-        } catch (Exception e) {
-            log.error("Failed to send email", e);
-            emailMessage.markAsFailed();
+        // Upload attachments and set storage paths
+        for (EmailAttachment att : emailMessage.getAttachments()) {
+            String storagePath = storageGateway.upload(emailMessage.getId(), att.getName(), att.getContent());
+            att.setStoragePath(storagePath);
         }
 
-        // Atualizamos o status
+        // 1. Persist the email in PENDING state
         emailRepository.save(emailMessage);
+
+        // 2. Send to RabbitMQ
+        rabbitTemplate.convertAndSend(
+                RabbitMQConfig.EMAIL_EXCHANGE,
+                RabbitMQConfig.EMAIL_ROUTING_KEY,
+                new EmailEnqueuedEvent(emailMessage.getId())
+        );
 
         return new EmailResponse(emailMessage.getId(), emailMessage.getStatus());
     }
