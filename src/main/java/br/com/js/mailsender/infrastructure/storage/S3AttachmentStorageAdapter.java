@@ -21,9 +21,9 @@ public class S3AttachmentStorageAdapter implements AttachmentStorageGateway {
 
     @Override
     public String upload(UUID emailId, String filename, byte[] content) {
-        String key = String.format("%s/%s", emailId, filename);
-        
-        PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+        var key = String.format("%s/%s", emailId, filename);
+
+        var putObjectRequest = PutObjectRequest.builder()
                 .bucket(bucketName)
                 .key(key)
                 .build();
@@ -34,7 +34,7 @@ public class S3AttachmentStorageAdapter implements AttachmentStorageGateway {
 
     @Override
     public byte[] download(String path) {
-        GetObjectRequest getObjectRequest = GetObjectRequest.builder()
+        var getObjectRequest = GetObjectRequest.builder()
                 .bucket(bucketName)
                 .key(path)
                 .build();

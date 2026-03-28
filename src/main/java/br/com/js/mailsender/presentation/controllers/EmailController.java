@@ -22,7 +22,7 @@ public class EmailController {
 
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<EmailResponse> sendEmail(@ModelAttribute SendEmailRequest request) {
-        EmailResponse response = sendEmailUseCase.execute(request);
+        var response = sendEmailUseCase.execute(request);
         return ResponseEntity
                 .created(URI.create("/api/v1/emails/" + response.id()))
                 .body(response);

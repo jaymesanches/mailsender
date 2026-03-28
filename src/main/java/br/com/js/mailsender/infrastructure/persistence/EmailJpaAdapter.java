@@ -20,7 +20,7 @@ public class EmailJpaAdapter implements EmailRepository {
 
     @Override
     public EmailMessage save(EmailMessage emailMessage) {
-        EmailJpaEntity entity = toEntity(emailMessage);
+        var entity = toEntity(emailMessage);
         repository.save(entity);
         return toDomain(entity);
     }
@@ -31,7 +31,7 @@ public class EmailJpaAdapter implements EmailRepository {
     }
 
     private EmailJpaEntity toEntity(EmailMessage domain) {
-        EmailJpaEntity entity = new EmailJpaEntity(
+        var entity = new EmailJpaEntity(
                 domain.getId(),
                 domain.getTo().value(),
                 domain.getSubject(),
@@ -60,13 +60,12 @@ public class EmailJpaAdapter implements EmailRepository {
     }
 
     private EmailMessage toDomain(EmailJpaEntity entity) {
-        List<EmailAttachment> attachments = entity.getAttachments() != null ?
-                entity.getAttachments().stream()
-                        .map(attEntity -> EmailAttachment.fromStorage(
-                                attEntity.getName(), 
-                                attEntity.getContentType(), 
-                                attEntity.getStoragePath()))
-                        .toList() : new ArrayList<>();
+        List<EmailAttachment> attachments = entity.getAttachments() != null ? entity.getAttachments().stream()
+                .map(attEntity -> EmailAttachment.fromStorage(
+                        attEntity.getName(),
+                        attEntity.getContentType(),
+                        attEntity.getStoragePath()))
+                .toList() : new ArrayList<>();
 
         return EmailMessage.reconstitute(
                 entity.getId(),

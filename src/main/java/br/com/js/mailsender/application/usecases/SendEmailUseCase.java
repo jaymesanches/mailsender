@@ -32,26 +32,27 @@ public class SendEmailUseCase {
         log.info("Enqueuing email request to: {}", request.to());
 
         var emailTo = Email.of(request.to());
-        
+
         List<EmailAttachment> attachments = Collections.emptyList();
         if (request.attachments() != null && !request.attachments().isEmpty()) {
             attachments = request.attachments().stream()
-                .map(file -> {
-                    try {
-                        return EmailAttachment.fromUpload(file.getOriginalFilename(), file.getContentType(), file.getBytes());
-                    } catch (Exception e) {
-                        throw new RuntimeException("Failed to read attachment content", e);
-                    }
-                })
-                .toList();
+                    .map(file -> {
+                        try {
+                            return EmailAttachment.fromUpload(file.getOriginalFilename(), file.getContentType(),
+                                    file.getBytes());
+                        } catch (Exception e) {
+                            throw new RuntimeException("Failed to read attachment content", e);
+                        }
+                    })
+                    .toList();
         }
 
-        boolean isHtml = request.isHtml() != null ? request.isHtml() : false;
+        var isHtml = request.isHtml() != null ? request.isHtml() : false;
         var emailMessage = EmailMessage.create(emailTo, request.subject(), request.body(), isHtml, attachments);
 
         // Upload attachments and set storage paths
         for (EmailAttachment att : emailMessage.getAttachments()) {
-            String storagePath = storageGateway.upload(emailMessage.getId(), att.getName(), att.getContent());
+            var storagePath = storageGateway.upload(emailMessage.getId(), att.getName(), att.getContent());
             att.setStoragePath(storagePath);
         }
 
@@ -62,8 +63,7 @@ public class SendEmailUseCase {
         rabbitTemplate.convertAndSend(
                 RabbitMQConfig.EMAIL_EXCHANGE,
                 RabbitMQConfig.EMAIL_ROUTING_KEY,
-                new EmailEnqueuedEvent(emailMessage.getId())
-        );
+                new EmailEnqueuedEvent(emailMessage.getId()));
 
         return new EmailResponse(emailMessage.getId(), emailMessage.getStatus());
     }

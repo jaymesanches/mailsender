@@ -1,6 +1,5 @@
 package br.com.js.mailsender.infrastructure.persistence;
 
-import br.com.js.mailsender.domain.model.Email;
 import br.com.js.mailsender.domain.model.EmailMessage.EmailStatus;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
