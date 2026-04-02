@@ -28,6 +28,6 @@ public class EmailAttachmentJpaEntity {
     private String storagePath;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "email_id", nullable = false)
+    @JoinColumn(name = "email_id", nullable = true)
     private EmailJpaEntity email;
 }

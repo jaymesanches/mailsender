@@ -2,6 +2,7 @@ package br.com.js.mailsender.infrastructure.messaging;
 
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
@@ -21,6 +22,7 @@ public class EmailQueueConsumer {
     private final AttachmentStorageGateway storageGateway;
 
     @RabbitListener(queues = RabbitMQConfig.EMAIL_QUEUE)
+    @Transactional(readOnly = true)
     public void consume(EmailEnqueuedEvent event) {
         log.info("Consuming email sending task for ID: {}", event.emailId());
 

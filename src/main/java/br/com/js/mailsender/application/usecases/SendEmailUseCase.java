@@ -27,7 +27,6 @@ public class SendEmailUseCase {
     private final AttachmentStorageGateway storageGateway;
     private final RabbitTemplate rabbitTemplate;
 
-    @Transactional
     public EmailResponse execute(SendEmailRequest request) {
         log.info("Enqueuing email request to: {}", request.to());
 
@@ -56,8 +55,7 @@ public class SendEmailUseCase {
             att.setStoragePath(storagePath);
         }
 
-        // 1. Persist the email in PENDING state
-        emailRepository.save(emailMessage);
+        var savedEmail = getSavedEmail(emailMessage);
 
         // 2. Send to RabbitMQ
         rabbitTemplate.convertAndSend(
@@ -65,6 +63,17 @@ public class SendEmailUseCase {
                 RabbitMQConfig.EMAIL_ROUTING_KEY,
                 new EmailEnqueuedEvent(emailMessage.getId()));
 
-        return new EmailResponse(emailMessage.getId(), emailMessage.getStatus());
+        return new EmailResponse(savedEmail.getId(), savedEmail.getStatus());
+    }
+
+    @Transactional
+    private EmailMessage getSavedEmail(EmailMessage emailMessage) {
+        // 1. Persist the email in PENDING state
+        var savedEmail = emailRepository.save(emailMessage);
+
+        if (savedEmail == null) {
+            throw new RuntimeException("Failed to save email");
+        }
+        return savedEmail;
     }
 }

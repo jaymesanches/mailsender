@@ -5,6 +5,8 @@ import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
 import br.com.js.mailsender.domain.ports.EmailRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -14,6 +16,7 @@ import java.util.UUID;
 
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class EmailJpaAdapter implements EmailRepository {
 
     private final EmailJpaRepository repository;
@@ -21,13 +24,16 @@ public class EmailJpaAdapter implements EmailRepository {
     @Override
     public EmailMessage save(EmailMessage emailMessage) {
         var entity = toEntity(emailMessage);
-        repository.save(entity);
+        repository.saveAndFlush(entity);
         return toDomain(entity);
     }
 
     @Override
     public Optional<EmailMessage> findById(UUID id) {
-        return repository.findById(id).map(this::toDomain);
+        var email = repository.findById(id).map(this::toDomain);
+        log.info("Email found: {}", email);
+
+        return email;
     }
 
     private EmailJpaEntity toEntity(EmailMessage domain) {

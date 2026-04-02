@@ -28,3 +28,12 @@ services:
       /usr/bin/mc mb myminio/mail-attachments;
       exit 0;
       "
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: mailsender_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
