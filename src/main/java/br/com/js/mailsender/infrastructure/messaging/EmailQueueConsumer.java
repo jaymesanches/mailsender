@@ -22,12 +22,10 @@ public class EmailQueueConsumer {
     private final AttachmentStorageGateway storageGateway;
 
     @RabbitListener(queues = RabbitMQConfig.EMAIL_QUEUE)
-    @Transactional(readOnly = true)
     public void consume(EmailEnqueuedEvent event) {
         log.info("Consuming email sending task for ID: {}", event.emailId());
 
-        var emailMessage = emailRepository.findById(event.emailId())
-                .orElseThrow(() -> new RuntimeException("Email not found: " + event.emailId()));
+        var emailMessage = getEmailMessage(event);
 
         if (emailMessage.getStatus() != EmailMessage.EmailStatus.PENDING) {
             log.warn("Email {} is already in status {}. Skipping.", event.emailId(), emailMessage.getStatus());
@@ -57,16 +55,37 @@ public class EmailQueueConsumer {
 
             emailGateway.send(messageWithContent);
 
-            emailMessage.markAsSent();
-            log.info("Email {} sent successfully", event.emailId());
+            updateEmailStatus(emailMessage, EmailMessage.EmailStatus.SENT);
         } catch (Exception e) {
             log.error("Failed to send email {}", event.emailId(), e);
-            emailMessage.markAsFailed();
+            updateEmailStatus(emailMessage, EmailMessage.EmailStatus.FAILED);
             // Aqui poderíamos lançar a exceção para o RabbitMQ tentar novamente (Retry
             // Policy)
             // Mas para simplificar, estamos marcando como FAILED.
         }
 
         emailRepository.save(emailMessage);
+    }
+
+    @Transactional
+    private void updateEmailStatus(EmailMessage emailMessage, EmailMessage.EmailStatus status) {
+        switch (status) {
+            case SENT:
+                emailMessage.markAsSent();
+                break;
+            case FAILED:
+                emailMessage.markAsFailed();
+                break;
+            default:
+                break;
+        }
+        emailRepository.save(emailMessage);
+    }
+
+    @Transactional(readOnly = true)
+    private EmailMessage getEmailMessage(EmailEnqueuedEvent event) {
+        var emailMessage = emailRepository.findById(event.emailId())
+                .orElseThrow(() -> new RuntimeException("Email not found: " + event.emailId()));
+        return emailMessage;
     }
 }

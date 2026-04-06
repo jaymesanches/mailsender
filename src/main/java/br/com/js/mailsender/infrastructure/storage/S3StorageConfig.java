@@ -28,7 +28,7 @@ public class S3StorageConfig {
                 .endpointOverride(URI.create(endpoint))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                .region(Region.US_EAST_1) // MinIO ignora a região mas o SDK exige
+                .region(Region.of("aws")) // MinIO ignora a região mas o SDK exige
                 .forcePathStyle(true) // Necessário para MinIO (usar path-style em vez de bucket-style)
                 .build();
     }
