@@ -20,6 +20,7 @@ import org.springframework.web.context.WebApplicationContext;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
@@ -96,5 +97,47 @@ class EmailAsyncFlowIT {
 
         // 5. Verificar se o gateway de e-mail foi chamado de fato
         verify(emailGateway, atLeastOnce()).send(any(EmailMessage.class));
+    }
+
+    @Test
+    void shouldThrowExceptionForRetryAndProcessDlqOnFailure() throws Exception {
+        // Setup mocks
+        when(storageGateway.upload(any(), any(), any())).thenReturn("mock/path");
+        when(storageGateway.download("mock/path")).thenReturn("dummy content".getBytes());
+        // Simular falha no envio para disparar o retry
+        org.mockito.Mockito.doThrow(new RuntimeException("Simulated Mail Server Error")).when(emailGateway).send(any());
+
+        // 1. Chamar a API via POST
+        String to = "test@example.com";
+        String subject = "Test Retry Subject";
+        String body = "Simulating failure...";
+
+        var result = mockMvc.perform(multipart("/api/v1/emails")
+                        .param("to", to)
+                        .param("subject", subject)
+                        .param("body", body)
+                        .param("isHtml", "false"))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        // Extrair o ID
+        String location = result.getResponse().getHeader("Location");
+        assertNotNull(location);
+        UUID emailId = UUID.fromString(location.substring(location.lastIndexOf("/") + 1));
+
+        // 2. Tentar consumir a fila normalmente (deve lançar AmqpException para disparar o Retry)
+        var event = new EmailEnqueuedEvent(emailId);
+        assertThrows(org.springframework.amqp.AmqpException.class, () -> emailQueueConsumer.consume(event));
+
+        // 3. Verificar que o status AINDA É PENDING (pois a exceção cancela a transação/nao processa status FAILED ou SENT ainda)
+        EmailMessage pendingEmail = emailRepository.findById(emailId).orElseThrow();
+        assertEquals(EmailMessage.EmailStatus.PENDING, pendingEmail.getStatus());
+
+        // 4. Simular RabbitMQ enviando a mensagem para a DLQ após esgotar tentativas
+        emailQueueConsumer.consumeDlq(event);
+
+        // 5. Verificar se o status mudou para FAILED pela DLQ
+        EmailMessage failedEmail = emailRepository.findById(emailId).orElseThrow();
+        assertEquals(EmailMessage.EmailStatus.FAILED, failedEmail.getStatus());
     }
 }

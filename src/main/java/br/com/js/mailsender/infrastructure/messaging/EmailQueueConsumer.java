@@ -57,14 +57,16 @@ public class EmailQueueConsumer {
 
             updateEmailStatus(emailMessage, EmailMessage.EmailStatus.SENT);
         } catch (Exception e) {
-            log.error("Failed to send email {}", event.emailId(), e);
-            updateEmailStatus(emailMessage, EmailMessage.EmailStatus.FAILED);
-            // Aqui poderíamos lançar a exceção para o RabbitMQ tentar novamente (Retry
-            // Policy)
-            // Mas para simplificar, estamos marcando como FAILED.
+            log.error("Transient error sending email {}, delegating to RabbitMQ retry policy", event.emailId(), e);
+            throw new org.springframework.amqp.AmqpException("Failed to send email", e);
         }
+    }
 
-        emailRepository.save(emailMessage);
+    @RabbitListener(queues = RabbitMQConfig.DLQ_QUEUE)
+    public void consumeDlq(EmailEnqueuedEvent event) {
+        log.error("Email processing failed after all retries. Moving to FAILED status. ID: {}", event.emailId());
+        var emailMessage = getEmailMessage(event);
+        updateEmailStatus(emailMessage, EmailMessage.EmailStatus.FAILED);
     }
 
     @Transactional
