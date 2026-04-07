@@ -28,7 +28,7 @@ public class EmailJpaEntity {
 
     private String subject;
 
-    @Column(columnDefinition = "TEXT")
+    @Column(columnDefinition = "CLOB")
     private String body;
 
     @Column(name = "is_html")

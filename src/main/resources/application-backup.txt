@@ -1,0 +1,42 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: mailsender
+  rabbitmq:
+    listener:
+      simple:
+        concurrency: 2
+        max-concurrency: 5
+        prefetch: 1
+        retry:
+          enabled: true
+          initial-interval: 3000ms
+          max-retries: 3
+          multiplier: 2.0
+    host: ${RABBITMQ_HOST:10.115.6.76}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:admin}
+    password: ${RABBITMQ_PASSWORD:admin123admin}
+  mail:
+    host: ${MAIL_HOST:10.117.2.205}
+    port: ${MAIL_PORT:1025}
+    properties:
+      mail:
+        smtp:
+          auth: ${MAIL_SMTP_AUTH:false}
+          starttls:
+            enable: ${MAIL_SMTP_STARTTLS:false}
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:'jdbc:postgresql://localhost:5432/mailsender_db'}
+    driverClassName: ${SPRING_DATASOURCE_DRIVER_CLASS_NAME:org.postgresql.Driver}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:postgres}
+  jpa:
+    hibernate:
+      ddl-auto: none
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+minio:
+  endpoint: ${MINIO_ENDPOINT:http://10.115.7.79:9900}
+  access-key: ${MINIO_ACCESS_KEY:mailsender-key}
+  secret-key: ${MINIO_SECRET_KEY:4ZXsempS58NvO4yVcrTaf4xIqkx3QQTVakE2J7WV}

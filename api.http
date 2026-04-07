@@ -1,5 +1,8 @@
+### 0. Health Check
+GET http://localhost:8081/api/v1/emails/health
+
 ### 1. Enviar e-mail de teste simples (Sem HTML e sem anexos)
-POST http://localhost:8080/api/v1/emails
+POST http://localhost:8081/api/v1/emails
 Content-Type: multipart/form-data; boundary=WebAppBoundary
 
 --WebAppBoundary
@@ -18,7 +21,7 @@ Olá! Este é um e-mail simples (texto plano) enviado via multipart/form-data.
 
 
 ### 2. Enviar e-mail formatado em HTML
-POST http://localhost:8080/api/v1/emails
+POST http://localhost:8081/api/v1/emails
 Content-Type: multipart/form-data; boundary=WebAppBoundary
 
 --WebAppBoundary
@@ -45,7 +48,7 @@ Content-Disposition: form-data; name="body"
 
 
 ### 3. Enviar e-mail com HTML e múltiplos anexos inline
-POST http://localhost:8080/api/v1/emails
+POST http://localhost:8081/api/v1/emails
 Content-Type: multipart/form-data; boundary=WebAppBoundary
 
 --WebAppBoundary
