@@ -21,6 +21,7 @@ public class EmailQueueConsumer {
     private final EmailGateway emailGateway;
     private final AttachmentStorageGateway storageGateway;
 
+    @Transactional
     @RabbitListener(queues = RabbitMQConfig.EMAIL_QUEUE)
     public void consume(EmailEnqueuedEvent event) {
         log.info("Consuming email sending task for ID: {}", event.emailId());
@@ -62,6 +63,7 @@ public class EmailQueueConsumer {
         }
     }
 
+    @Transactional
     @RabbitListener(queues = RabbitMQConfig.DLQ_QUEUE)
     public void consumeDlq(EmailEnqueuedEvent event) {
         log.error("Email processing failed after all retries. Moving to FAILED status. ID: {}", event.emailId());
@@ -69,7 +71,6 @@ public class EmailQueueConsumer {
         updateEmailStatus(emailMessage, EmailMessage.EmailStatus.FAILED);
     }
 
-    @Transactional
     private void updateEmailStatus(EmailMessage emailMessage, EmailMessage.EmailStatus status) {
         switch (status) {
             case SENT:
@@ -84,10 +85,8 @@ public class EmailQueueConsumer {
         emailRepository.save(emailMessage);
     }
 
-    @Transactional(readOnly = true)
     private EmailMessage getEmailMessage(EmailEnqueuedEvent event) {
-        var emailMessage = emailRepository.findById(event.emailId())
+        return emailRepository.findById(event.emailId())
                 .orElseThrow(() -> new RuntimeException("Email not found: " + event.emailId()));
-        return emailMessage;
     }
 }

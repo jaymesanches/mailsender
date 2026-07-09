@@ -27,6 +27,7 @@ public class SendEmailUseCase {
     private final AttachmentStorageGateway storageGateway;
     private final RabbitTemplate rabbitTemplate;
 
+    @Transactional
     public EmailResponse execute(SendEmailRequest request) {
         log.info("Enqueuing email request to: {}", request.to());
 
@@ -66,7 +67,6 @@ public class SendEmailUseCase {
         return new EmailResponse(savedEmail.getId(), savedEmail.getStatus());
     }
 
-    @Transactional
     private EmailMessage getSavedEmail(EmailMessage emailMessage) {
         // 1. Persist the email in PENDING state
         var savedEmail = emailRepository.save(emailMessage);
