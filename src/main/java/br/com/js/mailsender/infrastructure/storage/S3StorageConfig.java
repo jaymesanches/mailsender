@@ -13,13 +13,13 @@ import java.net.URI;
 @Configuration
 public class S3StorageConfig {
 
-    @Value("${minio.endpoint:http://localhost:9000}")
+    @Value("${ceph.endpoint:http://localhost:9000}")
     private String endpoint;
 
-    @Value("${minio.access-key:minioadmin}")
+    @Value("${ceph.access-key:minioadmin}")
     private String accessKey;
 
-    @Value("${minio.secret-key:minioadmin}")
+    @Value("${ceph.secret-key:minioadmin}")
     private String secretKey;
 
     @Bean

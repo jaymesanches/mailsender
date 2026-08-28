@@ -40,7 +40,7 @@ true
 Content-Disposition: form-data; name="body"
 
 <div style="font-family: Arial, sans-serif;">
-  <h1>Olá, Jayme!</h1>
+  <h1>Olá!</h1>
   <p>Este é um teste de mensagem contendo tags <strong>HTML</strong>.</p>
   <p style="color: blue;">Texto azul para testar a formatação!</p>
 </div>
