@@ -1,58 +1,66 @@
 package br.com.js.mailsender.infrastructure.storage;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
-import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
-import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
 import java.util.UUID;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
-@SpringBootTest
+@ExtendWith(MockitoExtension.class)
 class S3AttachmentStorageAdapterTest {
 
-    @Autowired
-    private S3AttachmentStorageAdapter adapter;
-
-    @Autowired
+    @Mock
     private S3Client s3Client;
 
-    private static boolean bucketCreated = false;
+    @InjectMocks
+    private S3AttachmentStorageAdapter adapter;
 
-    @BeforeEach
-    void setup() {
-        if (!bucketCreated) {
-            try {
-                // Verifica se o bucket existe, se dar NoSuchBucketException cria.
-                s3Client.headBucket(HeadBucketRequest.builder().bucket("mail-attachments").build());
-            } catch (NoSuchBucketException e) {
-                s3Client.createBucket(CreateBucketRequest.builder().bucket("mail-attachments").build());
-            }
-            bucketCreated = true;
-        }
+    @Captor
+    private ArgumentCaptor<PutObjectRequest> putCaptor;
+
+    @Captor
+    private ArgumentCaptor<GetObjectRequest> getCaptor;
+
+    @Test
+    void uploadDeveUsarChavePrefixadaPeloEmailIdEDevolverOCaminho() {
+        var emailId = UUID.randomUUID();
+
+        var path = adapter.upload(emailId, "doc.txt", "conteudo".getBytes());
+
+        assertThat(path).isEqualTo(emailId + "/doc.txt");
+
+        verify(s3Client).putObject(putCaptor.capture(), any(RequestBody.class));
+        assertThat(putCaptor.getValue().bucket()).isEqualTo("mail-attachments");
+        assertThat(putCaptor.getValue().key()).isEqualTo(path);
     }
 
     @Test
-    void deveFazerUploadEDownloadComSucesso() {
-        var emailId = UUID.randomUUID();
-        var filename = "arquivo-teste.txt";
-        var content = "Teste com MinIO local".getBytes();
+    void downloadDeveBuscarPelaChaveEDevolverOsBytes() {
+        var conteudo = "conteudo".getBytes();
+        when(s3Client.getObjectAsBytes(any(GetObjectRequest.class)))
+                .thenReturn(ResponseBytes.fromByteArray(GetObjectResponse.builder().build(), conteudo));
 
-        String path = adapter.upload(emailId, filename, content);
+        var bytes = adapter.download("chave/doc.txt");
 
-        assertNotNull(path);
-        assertTrue(path.contains(emailId.toString()));
-        assertTrue(path.contains(filename));
+        assertThat(bytes).containsExactly(conteudo);
 
-        byte[] downloaded = adapter.download(path);
-
-        assertArrayEquals(content, downloaded);
+        verify(s3Client).getObjectAsBytes(getCaptor.capture());
+        assertThat(getCaptor.getValue().bucket()).isEqualTo("mail-attachments");
+        assertThat(getCaptor.getValue().key()).isEqualTo("chave/doc.txt");
     }
 }

@@ -64,8 +64,23 @@ public class EmailQueueConsumer {
 
     @RabbitListener(queues = RabbitMQConfig.DLQ_QUEUE)
     public void consumeDlq(EmailEnqueuedEvent event) {
+        // Nao existe fila atras da DLQ: excecao aqui vira poison message, entao toda
+        // condicao irrecuperavel e logada e a mensagem descartada em vez de propagada.
+        var persistido = emailRepository.findById(event.emailId());
+
+        if (persistido.isEmpty()) {
+            log.error("Email {} chegou na DLQ mas nao existe no banco. Descartando.", event.emailId());
+            return;
+        }
+
+        var emailMessage = persistido.get();
+
+        if (emailMessage.getStatus() != EmailMessage.EmailStatus.PENDING) {
+            log.warn("Email {} chegou na DLQ mas ja esta em {}. Skipping.", event.emailId(), emailMessage.getStatus());
+            return;
+        }
+
         log.error("Email processing failed after all retries. Moving to FAILED status. ID: {}", event.emailId());
-        var emailMessage = getEmailMessage(event);
         updateEmailStatus(emailMessage, EmailMessage.EmailStatus.FAILED);
     }
 

@@ -9,10 +9,11 @@ public record Email(String value) {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException("Email cannot be empty");
         }
-        if (!EMAIL_PATTERN.matcher(value).matches()) {
+        var normalizado = value.trim().toLowerCase();
+        if (!EMAIL_PATTERN.matcher(normalizado).matches()) {
             throw new IllegalArgumentException("Invalid email: " + value);
         }
-        value = value.toLowerCase().trim();
+        value = normalizado;
     }
 
     public static Email of(String value) {
