@@ -5,7 +5,9 @@ import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @Getter
 @Setter
@@ -27,5 +29,12 @@ public class MailSenderProperties {
         private int maxPerMinute = 30;
         private boolean startTls = true;
         private boolean auth = true;
+
+        /**
+         * Propriedades JavaMail cruas, aplicadas por ultimo — sobrescrevem inclusive os
+         * timeouts padrao e o auth/startTls acima. Chave com ponto exige colchetes no
+         * YAML: {@code properties: { "[mail.smtp.timeout]": 7000 }}.
+         */
+        private Map<String, String> properties = new LinkedHashMap<>();
     }
 }

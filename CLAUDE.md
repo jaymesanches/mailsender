@@ -77,7 +77,9 @@ Contas são intercambiáveis: **uma fila, consumidores concorrentes**, nunca fil
 
 O caminho não-óbvio é o `FAILED` vindo da DLQ: `consumeDlq` só recebe o id, então quem grava é `recordAttemptFailure(conta, erro)` **durante a tentativa**, sem mudar o status; depois `markAsFailed()` (sem argumento) só vira a chave, preservando o diagnóstico. Não volte a passar o motivo no `markAsFailed`: isso apagaria o erro real do SMTP. A gravação do diagnóstico é best-effort e nunca pode impedir o retry.
 
-`InMemorySendRateLimiter` conta **por processo**: ao passar de uma instância, trocar por implementação distribuída ou particionar contas por instância, senão o limite do provedor estoura.
+Cada conta recebe timeouts de SMTP por padrão (`connectiontimeout` 5s, `timeout`/`writetimeout` 10s) — sem eles o JavaMail espera para sempre e uma conexão pendurada prende a thread do consumidor. O mapa `properties` por conta sobrescreve isso e qualquer outra propriedade JavaMail; chave com ponto **exige colchetes** no YAML (`"[mail.smtp.timeout]"`), senão o binder trata o ponto como aninhamento.
+
+`MailAccountPool` loga um WARN no boot (`Controle de taxa EM MEMORIA`) enquanto o limiter de memória estiver ativo e houver limite real — não apague sem trocar a implementação. `InMemorySendRateLimiter` conta **por processo**: ao passar de uma instância, trocar por implementação distribuída ou particionar contas por instância, senão o limite do provedor estoura.
 
 ### Estados e reenvio
 

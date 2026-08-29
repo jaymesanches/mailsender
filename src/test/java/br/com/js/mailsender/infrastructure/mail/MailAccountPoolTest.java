@@ -1,13 +1,23 @@
 package br.com.js.mailsender.infrastructure.mail;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -20,6 +30,50 @@ class MailAccountPoolTest {
 
     private final AtomicLong relogio = new AtomicLong(0);
     private final SendRateLimiter limiter = new InMemorySendRateLimiter(relogio::get);
+
+    private ListAppender<ILoggingEvent> logs;
+
+    @BeforeEach
+    void capturarLogs() {
+        logs = new ListAppender<>();
+        logs.start();
+        ((Logger) LoggerFactory.getLogger(MailAccountPool.class)).addAppender(logs);
+    }
+
+    @AfterEach
+    void pararCaptura() {
+        ((Logger) LoggerFactory.getLogger(MailAccountPool.class)).detachAppender(logs);
+    }
+
+    private boolean avisouSobreLimiteEmMemoria() {
+        return logs.list.stream().anyMatch(evento -> evento.getLevel() == Level.WARN
+                && evento.getFormattedMessage().contains("EM MEMORIA"));
+    }
+
+    @Test
+    void deveAvisarNoBootQueOLimiteEmMemoriaValePorProcesso() {
+        new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured);
+
+        assertThat(avisouSobreLimiteEmMemoria()).isTrue();
+    }
+
+    @Test
+    void naoDeveAvisarQuandoNaoHaLimiteParaFurar() {
+        // conta default de desenvolvimento nao tem teto: o aviso seria ruido
+        new MailAccountPool(new MailSenderProperties(), limiter, autoconfigured);
+
+        assertThat(avisouSobreLimiteEmMemoria()).isFalse();
+    }
+
+    @Test
+    void naoDeveAvisarComLimiterDistribuido() {
+        SendRateLimiter distribuido = (conta, max) -> true;
+
+        new MailAccountPool(comContas(30, "conta-a"), distribuido, autoconfigured);
+
+        // o aviso se desliga sozinho ao trocar a implementacao
+        assertThat(avisouSobreLimiteEmMemoria()).isFalse();
+    }
 
     @Test
     void deveRepassarAuthEStartTlsParaOSender() {
@@ -47,6 +101,53 @@ class MailAccountPoolTest {
         var javaMail = ((JavaMailSenderImpl) conta.sender()).getJavaMailProperties();
         assertThat(javaMail).containsEntry("mail.smtp.auth", "true")
                 .containsEntry("mail.smtp.starttls.enable", "true");
+    }
+
+    @Test
+    void deveAplicarTimeoutsPadraoParaNaoPendurarAThreadDoConsumidor() {
+        var conta = new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured)
+                .acquire().orElseThrow();
+
+        var javaMail = ((JavaMailSenderImpl) conta.sender()).getJavaMailProperties();
+        assertThat(javaMail).containsEntry("mail.smtp.connectiontimeout", "5000")
+                .containsEntry("mail.smtp.timeout", "10000")
+                .containsEntry("mail.smtp.writetimeout", "10000");
+    }
+
+    @Test
+    void propriedadesDaContaSobrescrevemOsPadroes() {
+        var props = new MailSenderProperties();
+        var conta = new MailSenderProperties.Account();
+        conta.setName("conta-a");
+        conta.setHost("smtp.example.com");
+        conta.setProperties(Map.of(
+                "mail.smtp.timeout", "30000",
+                "mail.smtp.ssl.trust", "smtp.example.com"));
+        props.setAccounts(List.of(conta));
+
+        var escolhida = new MailAccountPool(props, limiter, autoconfigured).acquire().orElseThrow();
+
+        var javaMail = ((JavaMailSenderImpl) escolhida.sender()).getJavaMailProperties();
+        assertThat(javaMail).containsEntry("mail.smtp.timeout", "30000")
+                .containsEntry("mail.smtp.ssl.trust", "smtp.example.com")
+                // o que nao foi sobrescrito continua no padrao
+                .containsEntry("mail.smtp.connectiontimeout", "5000");
+    }
+
+    @Test
+    void chaveComPontoPrecisaDeColchetesNoYaml() {
+        // o binder do Spring trata ponto como aninhamento em Map<String, String>;
+        // sem colchetes a propriedade nao chega na conta
+        var source = new MapConfigurationPropertySource(Map.of(
+                "mailsender.accounts[0].name", "conta-a",
+                "mailsender.accounts[0].host", "smtp.example.com",
+                "mailsender.accounts[0].properties[mail.smtp.timeout]", "7000"));
+
+        var props = new Binder(source).bind("mailsender", MailSenderProperties.class).get();
+
+        assertThat(props.getAccounts()).singleElement()
+                .satisfies(conta -> assertThat(conta.getProperties())
+                        .containsEntry("mail.smtp.timeout", "7000"));
     }
 
     private static MailSenderProperties comContas(int maxPerMinute, String... nomes) {

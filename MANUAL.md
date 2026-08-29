@@ -204,9 +204,31 @@ mailsender:
 
 `MailAccountPool.acquire()` percorre as contas a partir de um índice rotativo e devolve a primeira com permit no `SendRateLimiter` (janela deslizante de 60s por conta). Nenhuma disponível → `ThrottledMailFailure`, e a mensagem cai na sala de espera de 3.3.
 
+**Timeouts vêm por padrão**, e não são opcionais por acaso: sem eles o JavaMail espera para sempre, e um host que aceita a conexão TCP mas não responde prende a thread do consumidor — nada estoura, nem o retry nem a fila de espera entram em ação, e a vazão simplesmente para.
+
+| Propriedade | Padrão |
+|---|---|
+| `mail.smtp.connectiontimeout` | 5000 |
+| `mail.smtp.timeout` | 10000 |
+| `mail.smtp.writetimeout` | 10000 |
+
+Para ajustar, ou para qualquer outra propriedade JavaMail, cada conta aceita um mapa cru. Ele é aplicado **por último**, então sobrescreve os padrões e também `auth`/`start-tls`:
+
+```yaml
+    - name: conta-a
+      host: smtp.office365.com
+      properties:
+        "[mail.smtp.timeout]": 30000
+        "[mail.smtp.ssl.trust]": smtp.office365.com
+```
+
+> Os **colchetes são obrigatórios**: o binder do Spring trata ponto como aninhamento em `Map<String, String>`, e sem eles a propriedade não chega na conta. Há teste fixando isso (`chaveComPontoPrecisaDeColchetesNoYaml`).
+
+A conta `default` (quando `mailsender.accounts` está vazio) usa o sender autoconfigurado e **não** recebe esses padrões — ali os timeouts vão em `spring.mail.properties.mail.smtp.*`.
+
 **Lista vazia = conta única `default` usando o `spring.mail.*` autoconfigurado**, para o dev local com MailHog continuar funcionando sem configurar conta nenhuma.
 
-> **Ao subir a segunda instância da aplicação**, troque a implementação do `SendRateLimiter`. O `InMemorySendRateLimiter` conta por processo: duas instâncias contariam 30/min *cada* contra um limite de 30, e o sintoma seria throttling constante e difícil de atribuir. A alternativa sem Redis é particionar — cada instância com sua conta.
+> **Ao subir a segunda instância da aplicação**, troque a implementação do `SendRateLimiter`. A aplicação avisa no boot enquanto a de memória estiver ativa — procure por `Controle de taxa EM MEMORIA` no log de inicialização. O aviso só aparece quando há limite real para furar (a conta `default` de dev não tem teto) e se desliga sozinho ao trocar a implementação. O `InMemorySendRateLimiter` conta por processo: duas instâncias contariam 30/min *cada* contra um limite de 30, e o sintoma seria throttling constante e difícil de atribuir. A alternativa sem Redis é particionar — cada instância com sua conta.
 
 **Dimensionamento:** ~10k/dia dá ~7/min de média, folgado nos 30/min. Quem aperta é o limite **diário** de 10.000/caixa: duas contas dão 2x de margem, e é por isso que são duas.
 
@@ -298,9 +320,9 @@ A regra que sustenta a separação: **o domínio não conhece framework**. Não 
 ## 5. Testes
 
 ```bash
-./mvnw test                                              # 85 unitários, sem infra, ~10s
+./mvnw test                                              # 93 unitários, sem infra, ~10s
 ./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 9 de integração (exigem Postgres)
-./mvnw test -Dtest.excludedGroups=                       # tudo (94)
+./mvnw test -Dtest.excludedGroups=                       # tudo (102)
 ./mvnw test -Dtest=EmailQueueConsumerTest#dlqDeveMarcarComoFalha
 ```
 
