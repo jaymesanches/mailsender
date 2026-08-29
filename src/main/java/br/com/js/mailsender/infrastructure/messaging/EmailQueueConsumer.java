@@ -1,11 +1,12 @@
 package br.com.js.mailsender.infrastructure.messaging;
 
+import org.springframework.amqp.AmqpException;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
 
 import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
+import br.com.js.mailsender.domain.model.PermanentMailFailure;
 import br.com.js.mailsender.domain.ports.AttachmentStorageGateway;
 import br.com.js.mailsender.domain.ports.EmailGateway;
 import br.com.js.mailsender.domain.ports.EmailRepository;
@@ -23,9 +24,7 @@ public class EmailQueueConsumer {
 
     @RabbitListener(queues = RabbitMQConfig.EMAIL_QUEUE)
     public void consume(EmailEnqueuedEvent event) {
-        log.info("Consuming email sending task for ID: {}", event.emailId());
-
-        var emailMessage = getEmailMessage(event);
+        log.info("Consuming email sending task for ID: {}", event.emailId());var emailMessage = getEmailMessage(event);
 
         if (emailMessage.getStatus() != EmailMessage.EmailStatus.PENDING) {
             log.warn("Email {} is already in status {}. Skipping.", event.emailId(), emailMessage.getStatus());
@@ -33,32 +32,18 @@ public class EmailQueueConsumer {
         }
 
         try {
-            // Reconstruct attachments with bytes from MinIO
-            var attachmentsWithContent = emailMessage.getAttachments().stream()
-                    .map(att -> {
-                        byte[] content = storageGateway.download(att.getStoragePath());
-                        return new EmailAttachment(att.getName(), att.getContentType(), content, att.getStoragePath());
-                    })
-                    .toList();
+            emailGateway.send(withAttachmentContent(emailMessage));
 
-            // Create a temporary message with content for the gateway
-            var messageWithContent = EmailMessage.reconstitute(
-                    emailMessage.getId(),
-                    emailMessage.getTo(),
-                    emailMessage.getSubject(),
-                    emailMessage.getBody(),
-                    emailMessage.isHtml(),
-                    attachmentsWithContent,
-                    emailMessage.getStatus(),
-                    emailMessage.getCreatedAt(),
-                    emailMessage.getSentAt());
-
-            emailGateway.send(messageWithContent);
-
-            updateEmailStatus(emailMessage, EmailMessage.EmailStatus.SENT);
+            emailMessage.markAsSent();
+            emailRepository.save(emailMessage);
+        } catch (PermanentMailFailure e) {
+            // retentar nao muda o resultado: encerra em REJECTED sem passar pela DLQ
+            log.error("Email {} rejeitado em definitivo: {}", event.emailId(), e.getMessage());
+            emailMessage.markAsRejected(e.getMessage());
+            emailRepository.save(emailMessage);
         } catch (Exception e) {
             log.error("Transient error sending email {}, delegating to RabbitMQ retry policy", event.emailId(), e);
-            throw new org.springframework.amqp.AmqpException("Failed to send email", e);
+            throw new AmqpException("Failed to send email", e);
         }
     }
 
@@ -81,28 +66,44 @@ public class EmailQueueConsumer {
         }
 
         log.error("Email processing failed after all retries. Moving to FAILED status. ID: {}", event.emailId());
-        updateEmailStatus(emailMessage, EmailMessage.EmailStatus.FAILED);
-    }
-
-    @Transactional
-    private void updateEmailStatus(EmailMessage emailMessage, EmailMessage.EmailStatus status) {
-        switch (status) {
-            case SENT:
-                emailMessage.markAsSent();
-                break;
-            case FAILED:
-                emailMessage.markAsFailed();
-                break;
-            default:
-                break;
-        }
+        emailMessage.markAsFailed("Falha no envio apos esgotar as tentativas");
         emailRepository.save(emailMessage);
     }
 
-    @Transactional(readOnly = true)
+    /**
+     * Nao altera status de proposito: chegar aqui significa que nem o registro da
+     * falha funcionou, logo nao se sabe se o e-mail saiu. Marcar FAILED poderia
+     * mandar reenviar algo ja entregue — a decisao fica com um humano.
+     */
+    @RabbitListener(queues = RabbitMQConfig.PARKING_QUEUE)
+    public void consumeParking(EmailEnqueuedEvent event) {
+        log.error("Email {} estacionado: o registro da falha nao foi gravado e o estado no banco "
+                + "nao e confiavel. Verifique manualmente se o e-mail foi enviado.", event.emailId());
+    }
+
+    private EmailMessage withAttachmentContent(EmailMessage emailMessage) {
+        var attachmentsWithContent = emailMessage.getAttachments().stream()
+                .map(att -> new EmailAttachment(att.getName(), att.getContentType(),
+                        storageGateway.download(att.getStoragePath()), att.getStoragePath()))
+                .toList();
+
+        return EmailMessage.reconstitute(
+                emailMessage.getId(),
+                emailMessage.getTo(),
+                emailMessage.getSubject(),
+                emailMessage.getBody(),
+                emailMessage.isHtml(),
+                attachmentsWithContent,
+                emailMessage.getStatus(),
+                emailMessage.getCreatedAt(),
+                emailMessage.getSentAt(),
+                emailMessage.getAttempts(),
+                emailMessage.getLastError());
+    }
+
+    /** Lanca de proposito quando nao acha: e o que aciona o retry do listener. */
     private EmailMessage getEmailMessage(EmailEnqueuedEvent event) {
-        var emailMessage = emailRepository.findById(event.emailId())
+        return emailRepository.findById(event.emailId())
                 .orElseThrow(() -> new RuntimeException("Email not found: " + event.emailId()));
-        return emailMessage;
     }
 }

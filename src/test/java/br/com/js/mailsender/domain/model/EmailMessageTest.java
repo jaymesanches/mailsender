@@ -2,6 +2,8 @@ package br.com.js.mailsender.domain.model;
 
 import br.com.js.mailsender.domain.model.EmailMessage.EmailStatus;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -15,8 +17,17 @@ class EmailMessageTest {
 
     private static final Email TO = Email.of("dest@example.com");
 
+    private static EmailMessage nova() {
+        return EmailMessage.create(TO, "assunto", "corpo", false, List.of());
+    }
+
+    private static EmailMessage comStatus(EmailStatus status, int attempts) {
+        return EmailMessage.reconstitute(UUID.randomUUID(), TO, "assunto", "corpo", false, List.of(),
+                status, Instant.now(), null, attempts, null);
+    }
+
     @Test
-    void deveNascerPendenteComIdEDataDeCriacao() {
+    void deveNascerPendenteComIdDataDeCriacaoEUmaTentativa() {
         var message = EmailMessage.create(TO, "assunto", "corpo", false, null);
 
         assertThat(message.getId()).isNotNull();
@@ -24,6 +35,8 @@ class EmailMessageTest {
         assertThat(message.getCreatedAt()).isNotNull();
         assertThat(message.getSentAt()).isNull();
         assertThat(message.getAttachments()).isEmpty();
+        assertThat(message.getAttempts()).isEqualTo(1);
+        assertThat(message.getLastError()).isNull();
     }
 
     @Test
@@ -41,7 +54,7 @@ class EmailMessageTest {
 
     @Test
     void marcarComoEnviadoDefineStatusEDataDeEnvio() {
-        var message = EmailMessage.create(TO, "assunto", "corpo", true, List.of());
+        var message = nova();
 
         message.markAsSent();
 
@@ -50,26 +63,98 @@ class EmailMessageTest {
     }
 
     @Test
-    void marcarComoFalhaNaoDefineDataDeEnvio() {
-        var message = EmailMessage.create(TO, "assunto", "corpo", false, List.of());
+    void marcarComoEnviadoLimpaOErroAnterior() {
+        var message = comStatus(EmailStatus.FAILED, 1);
+        message.markForRetry();
 
-        message.markAsFailed();
+        message.markAsSent();
+
+        assertThat(message.getLastError()).isNull();
+    }
+
+    @Test
+    void marcarComoFalhaGuardaOMotivoENaoDefineDataDeEnvio() {
+        var message = nova();
+
+        message.markAsFailed("SMTP fora do ar");
 
         assertThat(message.getStatus()).isEqualTo(EmailStatus.FAILED);
+        assertThat(message.getLastError()).isEqualTo("SMTP fora do ar");
         assertThat(message.getSentAt()).isNull();
     }
 
     @Test
+    void deveTruncarErroMuitoLongoParaCaberNaColuna() {
+        var message = nova();
+
+        message.markAsFailed("x".repeat(900));
+
+        assertThat(message.getLastError()).hasSize(500);
+    }
+
+    @Test
+    void marcarComoRejeitadoEhTerminal() {
+        var message = nova();
+
+        message.markAsRejected("550 usuario inexistente");
+
+        assertThat(message.getStatus()).isEqualTo(EmailStatus.REJECTED);
+        assertThat(message.getLastError()).isEqualTo("550 usuario inexistente");
+        assertThat(message.isRetriable()).isFalse();
+        assertThatThrownBy(message::markForRetry)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Only failed emails can be retried");
+    }
+
+    @Test
     void naoDeveReprocessarMensagemJaFinalizada() {
-        var enviado = EmailMessage.create(TO, "assunto", "corpo", false, List.of());
+        var enviado = nova();
         enviado.markAsSent();
 
         assertThatThrownBy(enviado::markAsSent)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("Email already processed");
-        assertThatThrownBy(enviado::markAsFailed)
+        assertThatThrownBy(() -> enviado.markAsFailed("erro"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("Email already processed");
+        assertThatThrownBy(() -> enviado.markAsRejected("erro"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Email already processed");
+    }
+
+    @Test
+    void reenvioVoltaParaPendenteEIncrementaTentativa() {
+        var message = comStatus(EmailStatus.FAILED, 1);
+
+        message.markForRetry();
+
+        assertThat(message.getStatus()).isEqualTo(EmailStatus.PENDING);
+        assertThat(message.getAttempts()).isEqualTo(2);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = EmailStatus.class, names = { "PENDING", "SENT", "REJECTED" })
+    void reenvioSoSaiDeFalha(EmailStatus statusAtual) {
+        var message = comStatus(statusAtual, 1);
+
+        assertThatThrownBy(message::markForRetry)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Only failed emails can be retried");
+    }
+
+    @Test
+    void reenvioParaAoEsgotarOLimiteDeTentativas() {
+        var message = comStatus(EmailStatus.FAILED, EmailMessage.MAX_ATTEMPTS);
+
+        assertThat(message.isRetriable()).isFalse();
+        assertThatThrownBy(message::markForRetry)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Retry limit reached");
+    }
+
+    @Test
+    void falhaComTentativaDisponivelEhReenviavel() {
+        assertThat(comStatus(EmailStatus.FAILED, EmailMessage.MAX_ATTEMPTS - 1).isRetriable()).isTrue();
     }
 
     @Test
@@ -80,13 +165,15 @@ class EmailMessageTest {
 
         var message = EmailMessage.reconstitute(id, TO, "assunto", "corpo", true,
                 List.of(EmailAttachment.fromStorage("doc.txt", "text/plain", "chave/doc.txt")),
-                EmailStatus.SENT, criadoEm, enviadoEm);
+                EmailStatus.SENT, criadoEm, enviadoEm, 2, "erro anterior");
 
         assertThat(message.getId()).isEqualTo(id);
         assertThat(message.isHtml()).isTrue();
         assertThat(message.getStatus()).isEqualTo(EmailStatus.SENT);
         assertThat(message.getCreatedAt()).isEqualTo(criadoEm);
         assertThat(message.getSentAt()).isEqualTo(enviadoEm);
+        assertThat(message.getAttempts()).isEqualTo(2);
+        assertThat(message.getLastError()).isEqualTo("erro anterior");
         assertThat(message.getAttachments()).singleElement()
                 .satisfies(att -> {
                     assertThat(att.getStoragePath()).isEqualTo("chave/doc.txt");

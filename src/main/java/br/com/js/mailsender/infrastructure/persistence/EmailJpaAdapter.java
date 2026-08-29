@@ -3,10 +3,12 @@ package br.com.js.mailsender.infrastructure.persistence;
 import br.com.js.mailsender.domain.model.Email;
 import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
+import br.com.js.mailsender.domain.model.EmailMessage.EmailStatus;
 import br.com.js.mailsender.domain.ports.EmailRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -36,6 +38,11 @@ public class EmailJpaAdapter implements EmailRepository {
         return email;
     }
 
+    @Override
+    public List<UUID> findRetriableIds(int limit) {
+        return repository.findRetriableIds(EmailStatus.FAILED, EmailMessage.MAX_ATTEMPTS, Limit.of(limit));
+    }
+
     private EmailJpaEntity toEntity(EmailMessage domain) {
         var entity = new EmailJpaEntity(
                 domain.getId(),
@@ -46,7 +53,9 @@ public class EmailJpaAdapter implements EmailRepository {
                 domain.getStatus(),
                 new ArrayList<>(),
                 domain.getCreatedAt(),
-                domain.getSentAt());
+                domain.getSentAt(),
+                domain.getAttempts(),
+                domain.getLastError());
 
         if (domain.getAttachments() != null) {
             List<EmailAttachmentJpaEntity> attachmentEntities = domain.getAttachments().stream()
@@ -82,6 +91,8 @@ public class EmailJpaAdapter implements EmailRepository {
                 attachments,
                 entity.getStatus(),
                 entity.getCreatedAt(),
-                entity.getSentAt());
+                entity.getSentAt(),
+                entity.getAttempts(),
+                entity.getLastError());
     }
 }

@@ -1,0 +1,263 @@
+# Manual técnico — mailsender
+
+Microserviço de envio assíncrono de e-mail com anexos. Java 25 / Spring Boot 4.0.2, arquitetura hexagonal.
+
+A API recebe a requisição e responde imediatamente; o envio acontece depois, num consumidor de fila. Os anexos vão para um storage S3 (Ceph RGW ou MinIO) e o registro do e-mail para o Postgres. A fila carrega apenas o UUID do e-mail — nunca os bytes.
+
+Este manual narra os passos em ordem. Para as regras de estilo e as armadilhas de edição, veja `CLAUDE.md`.
+
+---
+
+## 1. Subir o ambiente
+
+### 1.1. Infraestrutura
+
+```bash
+docker compose up -d
+```
+
+Sobe quatro serviços:
+
+| Serviço | Portas | Observação |
+|---|---|---|
+| `rabbitmq:4.0-management` | 5672, **15672** (UI) | `guest/guest` |
+| `minio` | 9000, 9001 (console) | `minioadmin/minioadmin` |
+| `createbuckets` | — | job efêmero: cria o bucket `mail-attachments` e sai |
+| `postgres:17-alpine` | 5432 | banco `mailsender_db` |
+
+### 1.2. Variáveis de ambiente
+
+```bash
+cp .envsample .env
+```
+
+**`application.yml` não tem valores default: toda variável é obrigatória.** Se faltar uma, o contexto do Spring nem sobe — a falha é `PlaceholderResolutionException` no startup.
+
+Quem carrega o arquivo é a lib `spring-dotenv`, e ela lê **somente `.env`**. Um `.env-local` na pasta não é carregado; serve como sua cópia de referência local.
+
+| Grupo | Alimenta |
+|---|---|
+| `RABBITMQ_*` | conexão com o broker |
+| `MAIL_*` | servidor SMTP de saída |
+| `SPRING_DATASOURCE_*`, `SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT` | Postgres (datasource, JPA e Flyway) |
+| `CEPH_*` | storage de anexos — **é o que o código lê** |
+| `MINIO_*` | bloco órfão: nenhuma classe lê `minio.*` hoje |
+
+> Para apontar o storage ao MinIO local do compose, preencha as `CEPH_*` com `http://localhost:9000` e `minioadmin`. O `S3StorageConfig` fala S3 com `forcePathStyle`, que serve para os dois.
+
+### 1.3. Rodar
+
+```bash
+./mvnw spring-boot:run
+```
+
+A aplicação sobe na porta **8081**.
+
+### 1.4. Banco
+
+O Flyway roda no startup e aplica `src/main/resources/db/migration/V1__Initial_setup.sql`, criando `emails` e `email_attachments`. `baseline-on-migrate=true` e `ddl-auto=none`: **o Hibernate nunca gera schema** — toda mudança de estrutura é uma migration nova.
+
+### 1.5. Validar
+
+```bash
+curl http://localhost:8081/api/v1/emails/health
+```
+
+Ou abra `api.http`, que tem quatro requests prontos (health, texto simples, HTML, HTML com múltiplos anexos) — também disponíveis como run configs do IntelliJ.
+
+---
+
+## 2. Os passos de um e-mail
+
+```mermaid
+flowchart TD
+    A["POST /api/v1/emails<br/>multipart/form-data"] --> B[SendEmailUseCase]
+    B -->|"1. upload dos bytes"| S[("Storage S3<br/>mail-attachments")]
+    B -->|"2. INSERT status=PENDING"| D[("Postgres<br/>emails")]
+    B -->|"3. publica só o UUID"| Q["emails.send.queue"]
+    B --> R["201 Created<br/>{id, PENDING}"]
+
+    Q --> C[EmailQueueConsumer.consume]
+    C -->|"download dos bytes"| S
+    C --> M["SpringEmailGateway<br/>MimeMessage"]
+    M -->|sucesso| OK["UPDATE status=SENT"]
+    M -->|falha| RT{"retry: 4 entregas<br/>em ~19s"}
+    RT -->|"ainda PENDING"| C
+    RT -->|esgotou| DLQ["emails.send.dlq"]
+    DLQ --> CD[consumeDlq]
+    CD --> F["UPDATE status=FAILED"]
+    CD -.->|"falha aqui esgota retry"| P["emails.send.parking<br/>(so alerta)"]
+    F -.->|"reenvio: job ou endpoint"| Q
+```
+
+### 2.1. Entrada — do POST ao 201
+
+| # | Passo | Onde |
+|---|---|---|
+| 1 | `POST /api/v1/emails` com `multipart/form-data`, ligado ao record `SendEmailRequest(to, subject, body, isHtml, attachments)` via `@ModelAttribute` | `EmailController.java:25` |
+| 2 | `Email.of(to)` valida contra regex e normaliza: `trim()` e depois `toLowerCase()`. Inválido → `IllegalArgumentException` | `Email.java` |
+| 3 | Cada `MultipartFile` vira um `EmailAttachment.fromUpload`, com os bytes em memória | `SendEmailUseCase.java` |
+| 4 | `EmailMessage.create(...)` nasce **`PENDING`**, com UUID gerado e `createdAt` | `EmailMessage.java` |
+| 5 | Para cada anexo: `upload(emailId, nome, bytes)` → chave `{emailId}/{filename}` no bucket `mail-attachments`; a chave volta e é gravada no `storagePath` do anexo | `S3AttachmentStorageAdapter.java` |
+| 6 | `saveAndFlush` do agregado, mapeado para `EmailJpaEntity` + `EmailAttachmentJpaEntity` | `EmailJpaAdapter.java` |
+| 7 | Publica `EmailEnqueuedEvent(id)` em `emails.exchange` com routing key `emails.send.key` | `SendEmailUseCase.java` |
+| 8 | Responde `201 Created`, header `Location: /api/v1/emails/{id}`, corpo `{id, status: "PENDING"}` | `EmailController.java:28` |
+
+**A ordem 5 → 6 → 7 é significativa, não incidental.** O anexo tem de existir no storage *antes* da linha do banco que aponta para ele, e a mensagem só pode ser publicada *depois* de o registro estar gravado. Invertido, o consumidor encontraria um `storagePath` apontando para nada, ou um id que ainda não existe no banco. Há um teste `inOrder` em `SendEmailUseCaseTest` fixando essa sequência.
+
+### 2.2. Consumo — da fila ao SENT
+
+| # | Passo | Onde |
+|---|---|---|
+| 9 | `consume` escuta `emails.send.queue` (2 a 5 consumidores concorrentes, `prefetch: 1`) | `EmailQueueConsumer.java` |
+| 10 | Busca o registro pelo id. **Guarda de idempotência:** se o status não for `PENDING`, loga e retorna — entrega duplicada não reenvia e-mail | `EmailQueueConsumer.java` |
+| 11 | Rehidrata os anexos: `download(storagePath)` de cada um e monta um `EmailMessage.reconstitute` temporário, agora com bytes | `EmailQueueConsumer.java` |
+| 12 | Monta o `MimeMessage`: multipart só se houver anexo, UTF-8, e `setText` respeitando o `isHtml` | `SpringEmailGateway.java` |
+| 13 | Sucesso → `markAsSent()` e save: status **`SENT`** e `sentAt` preenchido | `EmailQueueConsumer.java` |
+
+Os bytes do anexo **nunca** trafegam pela fila nem são gravados no banco. A fila leva um UUID; o banco leva o `storagePath`. É o que mantém a mensagem pequena e o banco enxuto, ao custo de o consumidor precisar de um round-trip ao storage.
+
+---
+
+## 3. Quando dá errado
+
+A numeração continua a da seção anterior, porque é o mesmo fluxo.
+
+| # | Passo |
+|---|---|
+| 14 | Qualquer exceção no envio é traduzida para `AmqpException` e propagada. O registro **permanece `PENDING`** de propósito — quem decide o estado final é a DLQ, não a tentativa |
+| 15 | O retry é do listener Spring: `max-retries: 3` significa **4 entregas** (1 inicial + 3 retries), com intervalos de 3s, 6s e 10s — ver 3.2 |
+| 16 | Esgotadas as tentativas, o `messageRecoverer` republica em `emails.dlq.key`, caindo em `emails.send.dlq` |
+| 17 | `consumeDlq` marca **`FAILED`**. Ele **nunca propaga exceção**: id inexistente é logado e descartado; status já processado é ignorado |
+| 18 | Se o próprio `consumeDlq` falhar (banco fora, por exemplo) e esgotar as entregas, a mensagem vai para `emails.send.parking`, cujo consumidor **só alerta** — ver 3.5 |
+| 19 | Falha **permanente** (destinatário recusado pelo servidor) não passa por nada disso: `consume` encerra em `REJECTED` na hora, sem retry e sem DLQ |
+
+### 3.1. Topologia
+
+`DirectExchange emails.exchange`, com três filas:
+
+| Fila | Routing key | Consumidor |
+|---|---|---|
+| `emails.send.queue` | `emails.send.key` | `consume` |
+| `emails.send.dlq` | `emails.dlq.key` | `consumeDlq` |
+| `emails.send.parking` | `emails.parking.key` | **nenhum** — inspeção manual |
+
+Todas declaradas em `RabbitMQConfig.java`.
+
+### 3.2. Quantas tentativas, e em quanto tempo
+
+`max-retries: 3` **não** é 3 entregas. Da fonte do Spring Framework 7 (`RetryPolicy.java`): *"total attempts = 1 initial attempt + maxRetries attempts"* — logo, **4 entregas ao consumidor**.
+
+Os intervalos saem de `initial-interval: 3000ms` e `multiplier: 2.0`, limitados pelo `max-interval`, que não está no `application.yml` e portanto vale o default de **10000ms**:
+
+| Entrega | Momento | Intervalo até a próxima |
+|---|---|---|
+| 1ª | t=0 | 3s |
+| 2ª | t=3s | 6s |
+| 3ª | t=9s | 12s → **capado em 10s** |
+| 4ª | t=19s | esgotou → DLQ |
+
+Durante todo esse período (~19s) o registro permanece `PENDING`.
+
+> **O Boot 4 mudou a semântica.** `max-attempts` foi deprecado (nível `error`) em favor de `max-retries` justamente para desfazer essa ambiguidade: no Boot 3, `max-attempts: 3` dava 3 entregas; aqui, `max-retries: 3` dá 4. Ao portar configuração de um projeto Boot 3, confira esse número.
+
+**O retry é `stateless` (default) e bloqueia a thread.** A mensagem não volta ao broker entre as tentativas: o próprio consumidor espera. Com `concurrency: 2` e `prefetch: 1`, um SMTP fora do ar prende as duas threads por ~19s cada, e a vazão cai para ~2 e-mails por 19 segundos enquanto a fila cresce. É o sintoma a procurar quando a `emails.send.queue` começa a acumular.
+
+### 3.3. Por que o recoverer ramifica
+
+O `RepublishMessageRecoverer` do Spring tem destino fixo, e o bean `messageRecoverer` vale para **todos** os `@RabbitListener` da aplicação — inclusive o da própria DLQ. Com um destino fixo apontando para a DLQ, uma mensagem que falhasse no `consumeDlq` seria republicada na DLQ, consumida de novo, falharia de novo: loop infinito.
+
+Por isso o bean ramifica pela fila de origem, lida de `getConsumerQueue()`:
+
+- falha vinda de `emails.send.queue` → DLQ;
+- falha vinda de `emails.send.dlq` → parking.
+
+Assim uma indisponibilidade momentânea do banco ainda ganha as entregas normais, e só o que é de fato irrecuperável estaciona. `MessageRecovererRoutingTest` cobre os dois caminhos.
+
+### 3.4. Estados
+
+```
+                  ┌── markAsSent() ─────▶ SENT      (terminal)
+                  │
+PENDING ──────────┼── markAsRejected() ─▶ REJECTED  (terminal)
+    ▲             │
+    │             └── markAsFailed() ───▶ FAILED
+    │                                       │
+    └───── markForRetry() ◀──────────────────┘
+           (exige attempts < MAX_ATTEMPTS)
+```
+
+`markAsSent`, `markAsFailed` e `markAsRejected` só partem de `PENDING` — chamar qualquer uma sobre um e-mail já processado lança `IllegalStateException`. É a invariante que sustenta a idempotência dos três listeners.
+
+`markForRetry()` é a única transição que **não** parte de `PENDING`: exige `FAILED` e `attempts < MAX_ATTEMPTS` (3, constante em `EmailMessage`), incrementa `attempts` e devolve o e-mail a `PENDING`.
+
+| Status | Significado | Reenviável |
+|---|---|---|
+| `PENDING` | na fila ou em processamento | — |
+| `SENT` | servidor aceitou a mensagem | não |
+| `FAILED` | falha transitória, entregas do ciclo esgotadas | **sim**, até o cap |
+| `REJECTED` | servidor recusou o destinatário | não |
+
+### 3.5. Reenvio
+
+`FAILED` **não** é fim de linha. Dois gatilhos, ambos passando pelo mesmo `ResendEmailUseCase`:
+
+- **`POST /api/v1/emails/{id}/reenvio`** → `202 Accepted`. Responde `409 Conflict` se o e-mail não estiver `FAILED` ou já tiver esgotado as tentativas, e `404` se não existir.
+- **`RetryFailedEmailsJob`**, a cada `mailsender.retry.interval` (default 60s), varre até `mailsender.retry.batch-size` (default 50) e reenfileira. Um id problemático é logado e não aborta o lote.
+
+O reenvio **não re-sobe anexo**: o `storagePath` gravado segue válido, porque não há rotina de limpeza do bucket.
+
+O que impede reenvio indevido: `markForRetry` só sai de `FAILED`, a guarda do `consume` só age em `PENDING`, `MAX_ATTEMPTS` fecha o loop e `REJECTED` fica fora da query do job.
+
+---
+
+## 4. Mapa do código
+
+Pacote raiz `br.com.js.mailsender`.
+
+| Camada | Pacote | Conteúdo |
+|---|---|---|
+| **domain** | `domain.model`, `domain.ports` | `EmailMessage` (agregado), `Email` (value object), `EmailAttachment`; as interfaces `EmailRepository`, `EmailGateway`, `AttachmentStorageGateway` |
+| **application** | `application.usecases`, `application.dtos` | `SendEmailUseCase` orquestra o fluxo de entrada; os DTOs são records |
+| **infrastructure** | `infrastructure.{persistence,mail,storage,messaging}` | Implementações das ports: `EmailJpaAdapter`, `SpringEmailGateway`, `S3AttachmentStorageAdapter`; configuração e consumidor do Rabbit |
+| **presentation** | `presentation.controllers` | `EmailController` |
+
+A regra que sustenta a separação: **o domínio não conhece framework**. Não há anotação JPA em `EmailMessage` — o `EmailJpaAdapter` traduz entre o agregado e as entidades `*JpaEntity`. As dependências apontam de fora para dentro: infraestrutura implementa as interfaces que o domínio declara.
+
+---
+
+## 5. Testes
+
+```bash
+./mvnw test                                              # 64 unitários, sem infra, ~10s
+./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 8 de integração (exigem Postgres)
+./mvnw test -Dtest.excludedGroups=                       # tudo (72)
+./mvnw test -Dtest=EmailQueueConsumerTest#dlqDeveMarcarComoFalha
+```
+
+A suíte unitária usa Mockito + AssertJ e não sobe contexto Spring nem depende de infraestrutura — roda em qualquer máquina.
+
+Os testes de integração levam `@Tag("integration")`, que o surefire exclui por padrão através da propriedade `test.excludedGroups` no `pom.xml`. Eles usam `@ActiveProfiles("test")` com `src/test/resources/application-test.properties`, que fornece os placeholders do `application.yml` no lugar do `.env` — **se precisar ajustar credenciais de teste, é nesse arquivo, não no `.env`**.
+
+---
+
+## 6. Operação e pontos de atenção
+
+**Filas.** Inspecione no management UI (`localhost:15672`). Mensagem em `emails.send.parking` é sinal de problema grave: a aplicação não conseguiu nem registrar a falha, então o status no banco não é confiável. O consumidor da parking **só loga em ERROR** e deliberadamente **não altera status** — naquele ponto não se sabe se o e-mail saiu, e marcar `FAILED` mandaria o reenvio duplicar uma entrega. A decisão é humana: confirme no servidor de e-mail e, se não saiu, use o endpoint de reenvio.
+
+**Redeclaração de fila.** O RabbitMQ **rejeita** redeclarar uma fila existente com argumentos diferentes. Ao mudar argumentos em `RabbitMQConfig`, apague a fila na UI antes de subir. Filas novas são declaradas normalmente no startup.
+
+**Provisionamento em produção.** Se as filas são criadas fora da aplicação, `emails.send.parking` e seu binding precisam existir antes do deploy. Sem fila ligada à routing key, o exchange descarta a mensagem em silêncio.
+
+**Actuator.** Está no classpath sem configuração, então vale o default: só `/actuator/health` exposto. O `GET /api/v1/emails/health` do controller é independente disso.
+
+**Não há nenhum `@Transactional` no projeto, e é de propósito.** Toda operação faz uma única chamada de repositório, e `SimpleJpaRepository.save`/`saveAndFlush` já carregam transação própria — uma anotação a mais seria redundante.
+
+Se for reintroduzir, duas regras: (1) o proxy do Spring **não intercepta self-invocation**, então anotar um método chamado via `this` de dentro do mesmo bean não tem efeito — e mudar a visibilidade não altera isso, porque o que importa é o caminho da chamada, não o modificador; (2) a fronteira só ganha sentido quando a operação tiver **mais de uma escrita**, e nesse caso ela vai num método público de um bean colaborador.
+
+**Dois gaps de atomicidade que transação nenhuma cobre.** São as falhas reais do desenho atual:
+
+1. **`save` → `convertAndSend`** (`SendEmailUseCase`): se a publicação na fila falhar depois do registro gravado, o e-mail fica `PENDING` órfão para sempre — nenhuma mensagem na fila e nada que o reprocesse, já que não existe agendador nem consulta por status. A correção seria *transactional outbox*: gravar e-mail e evento na mesma transação, com um publicador lendo a outbox.
+2. **SMTP → `save(SENT)`** (`consume`): se o servidor aceitou a mensagem mas a gravação do status falhar, o registro segue `PENDING`, o retry roda e **o e-mail é enviado outra vez**. Transação não resolve, porque o SMTP não participa dela — a saída é idempotência no envio ou marcar `SENT` antes de enviar, aceitando o falso positivo.
+
+O primeiro caso não tem cobertura: um `PENDING` órfão não é `FAILED`, então nem o job nem o endpoint o alcançam. O segundo é exatamente o que a parking sinaliza — e é por isso que o consumidor dela não mexe em status.

@@ -4,6 +4,8 @@ import br.com.js.mailsender.domain.model.Email;
 import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
 import br.com.js.mailsender.domain.model.EmailMessage.EmailStatus;
+import br.com.js.mailsender.domain.model.PermanentMailFailure;
+import br.com.js.mailsender.domain.model.TransientMailFailure;
 import br.com.js.mailsender.domain.ports.AttachmentStorageGateway;
 import br.com.js.mailsender.domain.ports.EmailGateway;
 import br.com.js.mailsender.domain.ports.EmailRepository;
@@ -54,7 +56,12 @@ class EmailQueueConsumerTest {
     private static EmailMessage pendenteComAnexo(UUID id) {
         return EmailMessage.reconstitute(id, Email.of("dest@example.com"), "assunto", "corpo", false,
                 List.of(EmailAttachment.fromStorage("doc.txt", "text/plain", id + "/doc.txt")),
-                EmailStatus.PENDING, Instant.now(), null);
+                EmailStatus.PENDING, Instant.now(), null, 1, null);
+    }
+
+    private static EmailMessage comStatus(UUID id, EmailStatus status) {
+        return EmailMessage.reconstitute(id, Email.of("dest@example.com"), "assunto", "corpo", false,
+                List.of(), status, Instant.now(), null, 1, null);
     }
 
     @Test
@@ -77,12 +84,12 @@ class EmailQueueConsumerTest {
         assertThat(message.getSentAt()).isNotNull();
     }
 
-    @Test
-    void deveIgnorarMensagemQueJaSaiuDePendente() {
+    @ParameterizedTest
+    @EnumSource(value = EmailStatus.class, names = { "SENT", "FAILED", "REJECTED" })
+    void deveIgnorarMensagemQueJaSaiuDePendente(EmailStatus statusAtual) {
         var id = UUID.randomUUID();
-        var jaEnviado = EmailMessage.reconstitute(id, Email.of("dest@example.com"), "assunto", "corpo", false,
-                List.of(), EmailStatus.SENT, Instant.now(), Instant.now());
-        when(emailRepository.findById(id)).thenReturn(Optional.of(jaEnviado));
+        var message = comStatus(id, statusAtual);
+        when(emailRepository.findById(id)).thenReturn(Optional.of(message));
 
         consumer.consume(new EmailEnqueuedEvent(id));
 
@@ -91,23 +98,40 @@ class EmailQueueConsumerTest {
     }
 
     @Test
-    void deveTraduzirFalhaDeEnvioEmAmqpExceptionMantendoPendente() {
+    void falhaTransitoriaViraAmqpExceptionMantendoPendente() {
         var id = UUID.randomUUID();
         var message = pendenteComAnexo(id);
         when(emailRepository.findById(id)).thenReturn(Optional.of(message));
         when(storageGateway.download(any())).thenReturn("conteudo".getBytes());
-        doThrow(new RuntimeException("SMTP fora do ar")).when(emailGateway).send(any());
+        doThrow(new TransientMailFailure("SMTP fora do ar", new RuntimeException()))
+                .when(emailGateway).send(any());
 
         var event = new EmailEnqueuedEvent(id);
 
         assertThatThrownBy(() -> consumer.consume(event))
                 .isInstanceOf(AmqpException.class)
-                .hasMessage("Failed to send email")
-                .hasRootCauseMessage("SMTP fora do ar");
+                .hasMessage("Failed to send email");
 
         // status intacto: quem decide o FAILED e a DLQ, nao o retry
         assertThat(message.getStatus()).isEqualTo(EmailStatus.PENDING);
         verify(emailRepository, never()).save(any());
+    }
+
+    @Test
+    void falhaPermanenteViraRejectedSemPassarPelaDlq() {
+        var id = UUID.randomUUID();
+        var message = pendenteComAnexo(id);
+        when(emailRepository.findById(id)).thenReturn(Optional.of(message));
+        when(storageGateway.download(any())).thenReturn("conteudo".getBytes());
+        doThrow(new PermanentMailFailure("550 usuario inexistente", new RuntimeException()))
+                .when(emailGateway).send(any());
+
+        // nao lanca: retentar uma caixa que nao existe seria desperdicio
+        consumer.consume(new EmailEnqueuedEvent(id));
+
+        assertThat(message.getStatus()).isEqualTo(EmailStatus.REJECTED);
+        assertThat(message.getLastError()).isEqualTo("550 usuario inexistente");
+        verify(emailRepository).save(message);
     }
 
     @Test
@@ -136,21 +160,20 @@ class EmailQueueConsumerTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = EmailStatus.class, names = { "SENT", "FAILED" })
+    @EnumSource(value = EmailStatus.class, names = { "SENT", "FAILED", "REJECTED" })
     void dlqDeveIgnorarMensagemQueJaSaiuDePendente(EmailStatus statusAtual) {
         var id = UUID.randomUUID();
-        var jaProcessado = EmailMessage.reconstitute(id, Email.of("dest@example.com"), "assunto", "corpo", false,
-                List.of(), statusAtual, Instant.now(), null);
-        when(emailRepository.findById(id)).thenReturn(Optional.of(jaProcessado));
+        var message = comStatus(id, statusAtual);
+        when(emailRepository.findById(id)).thenReturn(Optional.of(message));
 
         consumer.consumeDlq(new EmailEnqueuedEvent(id));
 
-        assertThat(jaProcessado.getStatus()).isEqualTo(statusAtual);
+        assertThat(message.getStatus()).isEqualTo(statusAtual);
         verify(emailRepository, never()).save(any());
     }
 
     @Test
-    void dlqDeveMarcarComoFalha() {
+    void dlqDeveMarcarComoFalhaGuardandoOMotivo() {
         var id = UUID.randomUUID();
         var message = pendenteComAnexo(id);
         when(emailRepository.findById(id)).thenReturn(Optional.of(message));
@@ -158,8 +181,18 @@ class EmailQueueConsumerTest {
         consumer.consumeDlq(new EmailEnqueuedEvent(id));
 
         assertThat(message.getStatus()).isEqualTo(EmailStatus.FAILED);
+        assertThat(message.getLastError()).isNotBlank();
         assertThat(message.getSentAt()).isNull();
+        assertThat(message.isRetriable()).isTrue();
         verify(emailRepository).save(message);
         verifyNoInteractions(emailGateway, storageGateway);
+    }
+
+    @Test
+    void parkingApenasLogaSemTocarNoBanco() {
+        // nao se sabe se o e-mail saiu: alterar status poderia reenviar algo entregue
+        consumer.consumeParking(new EmailEnqueuedEvent(UUID.randomUUID()));
+
+        verifyNoInteractions(emailRepository, emailGateway, storageGateway);
     }
 }

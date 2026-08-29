@@ -6,14 +6,11 @@ import br.com.js.mailsender.domain.model.Email;
 import br.com.js.mailsender.domain.model.EmailAttachment;
 import br.com.js.mailsender.domain.model.EmailMessage;
 import br.com.js.mailsender.domain.ports.AttachmentStorageGateway;
+import br.com.js.mailsender.domain.ports.EmailDispatcher;
 import br.com.js.mailsender.domain.ports.EmailRepository;
-import br.com.js.mailsender.infrastructure.messaging.EmailEnqueuedEvent;
-import br.com.js.mailsender.infrastructure.messaging.RabbitMQConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Collections;
 import java.util.List;
@@ -25,7 +22,7 @@ public class SendEmailUseCase {
 
     private final EmailRepository emailRepository;
     private final AttachmentStorageGateway storageGateway;
-    private final RabbitTemplate rabbitTemplate;
+    private final EmailDispatcher emailDispatcher;
 
     public EmailResponse execute(SendEmailRequest request) {
         log.info("Enqueuing email request to: {}", request.to());
@@ -49,31 +46,16 @@ public class SendEmailUseCase {
         var isHtml = request.isHtml() != null ? request.isHtml() : false;
         var emailMessage = EmailMessage.create(emailTo, request.subject(), request.body(), isHtml, attachments);
 
-        // Upload attachments and set storage paths
+        // o anexo tem de existir no storage antes da linha que o referencia
         for (EmailAttachment att : emailMessage.getAttachments()) {
             var storagePath = storageGateway.upload(emailMessage.getId(), att.getName(), att.getContent());
             att.setStoragePath(storagePath);
         }
 
-        var savedEmail = getSavedEmail(emailMessage);
-
-        // 2. Send to RabbitMQ
-        rabbitTemplate.convertAndSend(
-                RabbitMQConfig.EMAIL_EXCHANGE,
-                RabbitMQConfig.EMAIL_ROUTING_KEY,
-                new EmailEnqueuedEvent(emailMessage.getId()));
-
-        return new EmailResponse(savedEmail.getId(), savedEmail.getStatus());
-    }
-
-    @Transactional
-    private EmailMessage getSavedEmail(EmailMessage emailMessage) {
-        // 1. Persist the email in PENDING state
         var savedEmail = emailRepository.save(emailMessage);
 
-        if (savedEmail == null) {
-            throw new RuntimeException("Failed to save email");
-        }
-        return savedEmail;
+        emailDispatcher.enqueue(savedEmail.getId());
+
+        return new EmailResponse(savedEmail.getId(), savedEmail.getStatus());
     }
 }

@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Visão geral
 
 Microserviço de envio assíncrono de e-mails. Java 25 + Spring Boot 4.0.2, arquitetura hexagonal.
-Fluxo: `POST multipart` → persiste `PENDING` + sobe anexos no storage S3 (Ceph RGW / MinIO) → publica evento no RabbitMQ → consumer baixa anexos, envia via SMTP e marca `SENT`; após esgotar retries a mensagem vai para a DLQ e é marcada `FAILED`.
+Fluxo: `POST multipart` → persiste `PENDING` + sobe anexos no storage S3 (Ceph RGW / MinIO) → publica evento no RabbitMQ → consumer baixa anexos, envia via SMTP e marca `SENT`. Falha transitória esgota o retry, vai para a DLQ e vira `FAILED` (**reenviável**); falha permanente vira `REJECTED` na hora, sem retry.
+
+`MANUAL.md` narra o fluxo passo a passo e o setup do ambiente — consulte-o quando precisar do *porquê* de uma etapa; este arquivo é o resumo acionável.
 
 Regras de estilo/arquitetura do projeto estão em `.agent/rules/java-moderno.md` (records para DTOs/VOs, domínio livre de framework, Lombok restrito a `@Getter`/`@Slf4j`/`@RequiredArgsConstructor`, `ddl-auto=none`, Testcontainers para integração). Siga-as.
 
@@ -57,11 +59,21 @@ Bytes nunca trafegam pela fila nem pelo banco: o evento carrega só o `emailId`;
 
 `DirectExchange emails.exchange` com três filas: `emails.send.queue` (`emails.send.key`), DLQ `emails.send.dlq` (`emails.dlq.key`) e parking `emails.send.parking` (`emails.parking.key`).
 
-Retry é do listener Spring (`spring.rabbitmq.listener.simple.retry`, 3 tentativas, backoff 3s × 2.0); ao esgotar, o `RepublishMessageRecoverer` publica explicitamente no destino — escolha deliberada para não depender dos argumentos `x-dead-letter-*` da fila já criada no broker.
+Retry é do listener Spring (`spring.rabbitmq.listener.simple.retry`): `max-retries: 3` são **4 entregas** (1 inicial + 3 retries, conforme o `RetryPolicy` do Spring Framework 7), em t=0/3s/9s/19s — o terceiro intervalo é capado pelo `max-interval` default de 10s. Retry `stateless`: bloqueia a thread do consumidor, não devolve ao broker. Ao esgotar, o `RepublishMessageRecoverer` publica explicitamente no destino — escolha deliberada para não depender dos argumentos `x-dead-letter-*` da fila já criada no broker.
 
-O `messageRecoverer` **ramifica pela fila de origem** (`getConsumerQueue()`): falha na fila principal → DLQ; falha ao consumir a DLQ → parking. Isso é obrigatório, não cosmético: o recoverer vale para todos os `@RabbitListener`, então um destino fixo na DLQ faria uma mensagem que falha no `consumeDlq` ser republicada na própria DLQ, em loop infinito. A parking queue não tem consumidor — é fim de linha para inspeção manual. `consumeDlq` então marca `FAILED`. **Os dois listeners** guardam a mesma condição — só agem sobre `PENDING` e ignoram (log + return) qualquer outro status, para que entrega duplicada ou DLQ após envio não estoure `IllegalStateException` no listener. `consumeDlq` vai além e **nunca propaga**: id inexistente é logado e descartado, porque não há fila atrás da DLQ para absorver a exceção — só `consume` lança (de propósito, para acionar o retry).
+O `messageRecoverer` **ramifica pela fila de origem** (`getConsumerQueue()`): falha na fila principal → DLQ; falha ao consumir a DLQ → parking. Isso é obrigatório, não cosmético: o recoverer vale para todos os `@RabbitListener`, então um destino fixo na DLQ faria uma mensagem que falha no `consumeDlq` ser republicada na própria DLQ, em loop infinito. A parking tem consumidor que **só loga em ERROR e nunca altera status**: chegar lá significa que o estado no banco não é confiável, e marcar `FAILED` faria o reenvio duplicar uma entrega. `consumeDlq` então marca `FAILED`. **Os dois listeners** guardam a mesma condição — só agem sobre `PENDING` e ignoram (log + return) qualquer outro status, para que entrega duplicada ou DLQ após envio não estoure `IllegalStateException` no listener. `consumeDlq` vai além e **nunca propaga**: id inexistente é logado e descartado, porque não há fila atrás da DLQ para absorver a exceção — só `consume` lança (de propósito, para acionar o retry).
 
 Alterar nomes/argumentos de fila em `RabbitMQConfig` não recria filas existentes no broker (RabbitMQ rejeita redeclaração divergente) — apague a fila no management UI (`:15672`) ao mudar argumentos. Filas novas (como a parking) são declaradas normalmente no startup.
+
+### Estados e reenvio
+
+`PENDING → SENT | FAILED | REJECTED`, e essas três transições só partem de `PENDING`. A quarta, `markForRetry()`, é a exceção: exige `FAILED` **e** `attempts < EmailMessage.MAX_ATTEMPTS` (3), incrementa `attempts` e devolve a `PENDING`.
+
+`FAILED` é reenviável; `SENT` e `REJECTED` são terminais. `SpringEmailGateway` classifica a falha do SMTP em `TransientMailFailure` / `PermanentMailFailure` (destinatário presente em `SendFailedException.getInvalidAddresses()`), mantendo o detalhe do provedor na infraestrutura — o consumidor decide o status só pelo tipo da exceção.
+
+Dois gatilhos de reenvio, ambos no `ResendEmailUseCase`: `POST /api/v1/emails/{id}/reenvio` (202; 409 em transição inválida, via `ApiExceptionHandler`) e `RetryFailedEmailsJob` (`@Scheduled`, `mailsender.retry.interval`). Reenvio **não re-sobe anexo** — o `storagePath` segue válido.
+
+`EmailDispatcher` (port) é o único caminho para a fila: `SendEmailUseCase` e `ResendEmailUseCase` não conhecem RabbitMQ.
 
 ### Persistência
 
@@ -71,7 +83,7 @@ Flyway com `baseline-on-migrate=true`; migrations em `src/main/resources/db/migr
 
 ## Cuidados ao editar
 
-- `@Transactional` em métodos **privados** (`SendEmailUseCase.getSavedEmail`, `EmailQueueConsumer.updateEmailStatus`, `getEmailMessage`) é ignorado pelo proxy do Spring — hoje funciona por causa do `saveAndFlush` no adapter. Se for mexer em transacionalidade nessas classes, mova a anotação para método público de um bean colaborador em vez de "consertar" no lugar.
+- **O projeto não tem nenhum `@Transactional`, e isso é deliberado.** Toda operação é uma única chamada de repositório, e `SimpleJpaRepository.save`/`saveAndFlush` já abrem transação própria. Não reintroduza a anotação num método chamado via `this` de dentro do mesmo bean: o proxy não intercepta self-invocation, e mudar a visibilidade (`private` → `protected`/`public`) não resolve. A primeira fronteira transacional real só passa a fazer sentido quando uma operação tiver **mais de uma escrita** — e aí ela vai num método público de um bean colaborador.
 - `EmailJpaAdapter.toEntity` cria entidades de anexo **novas** a cada `save`; combinado com `orphanRemoval`, atualizar um e-mail existente recria as linhas de anexo.
 - `EmailJpaEntity.body` está anotado com `columnDefinition = "CLOB"` enquanto a migration usa `TEXT` (resquício da variante Oracle). Não deixe o Hibernate validar/gerar DDL.
 - `@AutoConfigureMockMvc` **não existe** no `spring-boot-starter-test` 4.0.2 (saiu para outro módulo). Monte o `MockMvc` com `MockMvcBuilders.webAppContextSetup(context)`, como em `EmailAsyncFlowIntegrationTest`.

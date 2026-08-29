@@ -42,4 +42,10 @@ public class EmailJpaEntity {
 
     private Instant createdAt;
     private Instant sentAt;
+
+    @Column(nullable = false)
+    private int attempts;
+
+    @Column(length = 500)
+    private String lastError;
 }
