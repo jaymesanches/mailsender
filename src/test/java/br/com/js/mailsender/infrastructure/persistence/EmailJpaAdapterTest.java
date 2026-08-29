@@ -45,7 +45,7 @@ class EmailJpaAdapterTest {
     void saveDeveMapearDominioParaEntidadeComRetrovinculoDoAnexo() {
         var domain = EmailMessage.reconstitute(UUID.randomUUID(), Email.of("dest@example.com"), "assunto", "corpo",
                 true, List.of(EmailAttachment.fromStorage("doc.txt", "text/plain", "chave/doc.txt")),
-                EmailStatus.FAILED, CRIADO_EM, null, 2, "SMTP fora do ar");
+                EmailStatus.FAILED, CRIADO_EM, null, "conta-a", 2, "SMTP fora do ar");
 
         var result = adapter.save(domain);
 
@@ -61,6 +61,7 @@ class EmailJpaAdapterTest {
         assertThat(entity.getSentAt()).isNull();
         assertThat(entity.getAttempts()).isEqualTo(2);
         assertThat(entity.getLastError()).isEqualTo("SMTP fora do ar");
+        assertThat(entity.getLastAccount()).isEqualTo("conta-a");
         assertThat(entity.getAttachments()).singleElement().satisfies(att -> {
             assertThat(att.getName()).isEqualTo("doc.txt");
             assertThat(att.getContentType()).isEqualTo("text/plain");
@@ -89,6 +90,7 @@ class EmailJpaAdapterTest {
         assertThat(domain.getCreatedAt()).isEqualTo(CRIADO_EM);
         assertThat(domain.getSentAt()).isEqualTo(CRIADO_EM.plusSeconds(5));
         assertThat(domain.getAttempts()).isEqualTo(1);
+        assertThat(domain.getLastAccount()).isEqualTo("conta-b");
         assertThat(domain.getAttachments()).singleElement()
                 .satisfies(att -> assertThat(att.getStoragePath()).isEqualTo("chave/doc.txt"));
     }
@@ -125,6 +127,7 @@ class EmailJpaAdapterTest {
         entity.setStatus(EmailStatus.SENT);
         entity.setCreatedAt(CRIADO_EM);
         entity.setSentAt(CRIADO_EM.plusSeconds(5));
+        entity.setLastAccount("conta-b");
         entity.setAttempts(1);
 
         var attachment = new EmailAttachmentJpaEntity();

@@ -54,3 +54,23 @@ ceph:
   endpoint: ${CEPH_ENDPOINT}
   access-key: ${CEPH_ACCESS_KEY}
   secret-key: ${CEPH_SECRET_KEY}
+
+mailsender:
+  throttle:
+    max-cycles: 10
+  accounts:
+    - name: mailhog - externo
+      host: smtp.mailhog.site
+      port: 2525
+      username: u_75468a9d
+      password: p_fe025a623ed5c6b9
+      max-per-minute: 30
+    - name: mailhog - interno
+      host: 10.117.2.204
+      port: 1025
+      username: protocolo@mailhog.com
+      password:
+      max-per-minute: 30
+      # MailHog interno nao pede credencial nem TLS; o default e true (Exchange)
+      auth: false
+      start-tls: false

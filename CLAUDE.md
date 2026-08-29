@@ -57,13 +57,27 @@ Bytes nunca trafegam pela fila nem pelo banco: o evento carrega só o `emailId`;
 
 ### Mensageria
 
-`DirectExchange emails.exchange` com três filas: `emails.send.queue` (`emails.send.key`), DLQ `emails.send.dlq` (`emails.dlq.key`) e parking `emails.send.parking` (`emails.parking.key`).
+`DirectExchange emails.exchange` com quatro filas: `emails.send.queue` (`emails.send.key`), DLQ `emails.send.dlq` (`emails.dlq.key`), parking `emails.send.parking` (`emails.parking.key`) e espera `emails.send.wait` (`emails.wait.key`, TTL 60s + DLX de volta para a principal).
 
 Retry é do listener Spring (`spring.rabbitmq.listener.simple.retry`): `max-retries: 3` são **4 entregas** (1 inicial + 3 retries, conforme o `RetryPolicy` do Spring Framework 7), em t=0/3s/9s/19s — o terceiro intervalo é capado pelo `max-interval` default de 10s. Retry `stateless`: bloqueia a thread do consumidor, não devolve ao broker. Ao esgotar, o `RepublishMessageRecoverer` publica explicitamente no destino — escolha deliberada para não depender dos argumentos `x-dead-letter-*` da fila já criada no broker.
 
 O `messageRecoverer` **ramifica pela fila de origem** (`getConsumerQueue()`): falha na fila principal → DLQ; falha ao consumir a DLQ → parking. Isso é obrigatório, não cosmético: o recoverer vale para todos os `@RabbitListener`, então um destino fixo na DLQ faria uma mensagem que falha no `consumeDlq` ser republicada na própria DLQ, em loop infinito. A parking tem consumidor que **só loga em ERROR e nunca altera status**: chegar lá significa que o estado no banco não é confiável, e marcar `FAILED` faria o reenvio duplicar uma entrega. `consumeDlq` então marca `FAILED`. **Os dois listeners** guardam a mesma condição — só agem sobre `PENDING` e ignoram (log + return) qualquer outro status, para que entrega duplicada ou DLQ após envio não estoure `IllegalStateException` no listener. `consumeDlq` vai além e **nunca propaga**: id inexistente é logado e descartado, porque não há fila atrás da DLQ para absorver a exceção — só `consume` lança (de propósito, para acionar o retry).
 
 Alterar nomes/argumentos de fila em `RabbitMQConfig` não recria filas existentes no broker (RabbitMQ rejeita redeclaração divergente) — apague a fila no management UI (`:15672`) ao mudar argumentos. Filas novas (como a parking) são declaradas normalmente no startup.
+
+### Throttling e pool de contas
+
+O provedor (Exchange Online) limita ~30 msg/min e ~10.000 destinatários/dia **por caixa**. `SpringEmailGateway` classifica pela classe do código estendido (RFC 3463): `4.x.x` → `ThrottledMailFailure`, `5.x.x` ou `getInvalidAddresses()` não vazio → `PermanentMailFailure`, sem código estendido → `TransientMailFailure`.
+
+**Throttling não é falha do e-mail.** O consumidor manda para `emails.send.wait` (TTL 60s, DLX devolve à fila principal) e **não toca em `status` nem em `attempts`**. O contador de ciclos vai no header `x-throttle-cycle`; passando de `EmailQueueConsumer.MAX_THROTTLE_CYCLES` (10) vira `FAILED`, que é reenviável. Nunca reintroduza throttling na escada de retry: ela se esgota em 19s e um limite por minuto precisa de ~60s.
+
+Contas são intercambiáveis: **uma fila, consumidores concorrentes**, nunca fila por conta. `MailAccountPool.acquire()` roda um índice rotativo e consulta o `SendRateLimiter` (janela de 60s por conta); vazio → `ThrottledMailFailure`. `mailsender.accounts[]` vazio cai no `spring.mail.*` autoconfigurado como conta `default` (dev local com MailHog).
+
+`EmailGateway.send` **devolve o nome da conta** que entregou. As três exceções de envio herdam de `MailFailure`, que carrega `account()` — assim `last_account` é gravada em **qualquer desfecho**, não só no sucesso.
+
+O caminho não-óbvio é o `FAILED` vindo da DLQ: `consumeDlq` só recebe o id, então quem grava é `recordAttemptFailure(conta, erro)` **durante a tentativa**, sem mudar o status; depois `markAsFailed()` (sem argumento) só vira a chave, preservando o diagnóstico. Não volte a passar o motivo no `markAsFailed`: isso apagaria o erro real do SMTP. A gravação do diagnóstico é best-effort e nunca pode impedir o retry.
+
+`InMemorySendRateLimiter` conta **por processo**: ao passar de uma instância, trocar por implementação distribuída ou particionar contas por instância, senão o limite do provedor estoura.
 
 ### Estados e reenvio
 

@@ -18,6 +18,9 @@ public class RabbitMQConfig {
     public static final String EMAIL_DLQ_ROUTING_KEY = "emails.dlq.key";
     public static final String PARKING_QUEUE = "emails.send.parking";
     public static final String EMAIL_PARKING_ROUTING_KEY = "emails.parking.key";
+    public static final String WAIT_QUEUE = "emails.send.wait";
+    public static final String EMAIL_WAIT_ROUTING_KEY = "emails.wait.key";
+    public static final String THROTTLE_CYCLE_HEADER = "x-throttle-cycle";
 
     @Bean
     public DirectExchange emailExchange() {
@@ -56,6 +59,25 @@ public class RabbitMQConfig {
     @Bean
     public Binding parkingBinding() {
         return BindingBuilder.bind(emailParkingQueue()).to(emailExchange()).with(EMAIL_PARKING_ROUTING_KEY);
+    }
+
+    /**
+     * Sala de espera do throttling: ninguem consome. A mensagem expira pelo TTL e o
+     * dead-letter a devolve para a fila principal — o mesmo mecanismo da DLQ, invertido.
+     * Mudar o TTL depois exige apagar a fila: o broker rejeita redeclaracao divergente.
+     */
+    @Bean
+    public Queue emailWaitQueue() {
+        return QueueBuilder.durable(WAIT_QUEUE)
+                .withArgument("x-message-ttl", 60000)
+                .withArgument("x-dead-letter-exchange", EMAIL_EXCHANGE)
+                .withArgument("x-dead-letter-routing-key", EMAIL_ROUTING_KEY)
+                .build();
+    }
+
+    @Bean
+    public Binding waitBinding() {
+        return BindingBuilder.bind(emailWaitQueue()).to(emailExchange()).with(EMAIL_WAIT_ROUTING_KEY);
     }
 
     @Bean

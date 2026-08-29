@@ -54,6 +54,7 @@ public class EmailJpaAdapter implements EmailRepository {
                 new ArrayList<>(),
                 domain.getCreatedAt(),
                 domain.getSentAt(),
+                domain.getLastAccount(),
                 domain.getAttempts(),
                 domain.getLastError());
 
@@ -92,6 +93,7 @@ public class EmailJpaAdapter implements EmailRepository {
                 entity.getStatus(),
                 entity.getCreatedAt(),
                 entity.getSentAt(),
+                entity.getLastAccount(),
                 entity.getAttempts(),
                 entity.getLastError());
     }

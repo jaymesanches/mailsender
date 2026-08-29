@@ -125,22 +125,24 @@ A numeração continua a da seção anterior, porque é o mesmo fluxo.
 
 | # | Passo |
 |---|---|
-| 14 | Qualquer exceção no envio é traduzida para `AmqpException` e propagada. O registro **permanece `PENDING`** de propósito — quem decide o estado final é a DLQ, não a tentativa |
+| 14 | Falha **transitória** vira `AmqpException` e propaga. O registro **permanece `PENDING`** de propósito — quem decide o estado final é a DLQ, não a tentativa |
 | 15 | O retry é do listener Spring: `max-retries: 3` significa **4 entregas** (1 inicial + 3 retries), com intervalos de 3s, 6s e 10s — ver 3.2 |
 | 16 | Esgotadas as tentativas, o `messageRecoverer` republica em `emails.dlq.key`, caindo em `emails.send.dlq` |
 | 17 | `consumeDlq` marca **`FAILED`**. Ele **nunca propaga exceção**: id inexistente é logado e descartado; status já processado é ignorado |
-| 18 | Se o próprio `consumeDlq` falhar (banco fora, por exemplo) e esgotar as entregas, a mensagem vai para `emails.send.parking`, cujo consumidor **só alerta** — ver 3.5 |
+| 18 | Se o próprio `consumeDlq` falhar (banco fora, por exemplo) e esgotar as entregas, a mensagem vai para `emails.send.parking`, cujo consumidor **só alerta** — ver §6 |
 | 19 | Falha **permanente** (destinatário recusado pelo servidor) não passa por nada disso: `consume` encerra em `REJECTED` na hora, sem retry e sem DLQ |
+| 20 | Falha por **throttling** (`4.x.x`) também sai da escada: vai para `emails.send.wait`, espera ~60s e volta — sem tocar em `status` nem `attempts`. Ver 3.3 |
 
 ### 3.1. Topologia
 
-`DirectExchange emails.exchange`, com três filas:
+`DirectExchange emails.exchange`, com quatro filas:
 
 | Fila | Routing key | Consumidor |
 |---|---|---|
 | `emails.send.queue` | `emails.send.key` | `consume` |
 | `emails.send.dlq` | `emails.dlq.key` | `consumeDlq` |
-| `emails.send.parking` | `emails.parking.key` | **nenhum** — inspeção manual |
+| `emails.send.parking` | `emails.parking.key` | `consumeParking` — só alerta |
+| `emails.send.wait` | `emails.wait.key` | **nenhum** — TTL de 60s devolve à principal |
 
 Todas declaradas em `RabbitMQConfig.java`.
 
@@ -163,7 +165,74 @@ Durante todo esse período (~19s) o registro permanece `PENDING`.
 
 **O retry é `stateless` (default) e bloqueia a thread.** A mensagem não volta ao broker entre as tentativas: o próprio consumidor espera. Com `concurrency: 2` e `prefetch: 1`, um SMTP fora do ar prende as duas threads por ~19s cada, e a vazão cai para ~2 e-mails por 19 segundos enquanto a fila cresce. É o sintoma a procurar quando a `emails.send.queue` começa a acumular.
 
-### 3.3. Por que o recoverer ramifica
+### 3.3. Throttling: esperar em vez de retentar
+
+O servidor de envio (Exchange Online) limita **~30 mensagens/minuto por caixa** e **~10.000 destinatários/dia**. Ao estourar, responde algo como:
+
+```
+432 4.3.2 STOREDRV.ClientSubmit; sender thread limit exceeded
+```
+
+Isso **não é falha do e-mail** — é falta de capacidade naquele instante. Tratá-lo como falha comum seria errar a cadência: a escada de retry se esgota em 19s, enquanto um limite por minuto pede que se espere o minuto virar.
+
+`SpringEmailGateway` classifica lendo a **classe do código estendido** (RFC 3463 — padrão SMTP, não detalhe da Microsoft):
+
+| Sinal na resposta | Classificação | Destino |
+|---|---|---|
+| `getInvalidAddresses()` não vazio, ou `5.x.x` | `PermanentMailFailure` | `REJECTED` |
+| `4.x.x` | `ThrottledMailFailure` | fila de espera |
+| sem código estendido (conexão recusada) | `TransientMailFailure` | escada de retry |
+
+O e-mail throttled vai para `emails.send.wait`, que **não tem consumidor**: a mensagem expira pelo TTL de 60s e o dead-letter a devolve para a fila principal — o mesmo mecanismo da DLQ, invertido, sem plugin nenhum.
+
+**Enquanto espera, nada muda no banco**: nem `status`, nem `attempts`. Um contador de ciclos viaja no header `x-throttle-cycle`; ao passar de `MAX_THROTTLE_CYCLES` (10, ~10 minutos) o e-mail deixa de ser pico e vira `FAILED` — que é reenviável pelo fluxo de 3.6.
+
+### 3.4. Pool de contas
+
+Como as contas são intercambiáveis (existem só para somar capacidade), há **uma fila e consumidores concorrentes**, não fila por conta — assim uma conta ociosa ajuda a drenar o trabalho da outra.
+
+```yaml
+mailsender:
+  accounts:
+    - name: conta-a
+      host: smtp.office365.com
+      port: 587
+      username: ${MAIL_A_USERNAME}
+      password: ${MAIL_A_PASSWORD}
+      max-per-minute: 30
+```
+
+`MailAccountPool.acquire()` percorre as contas a partir de um índice rotativo e devolve a primeira com permit no `SendRateLimiter` (janela deslizante de 60s por conta). Nenhuma disponível → `ThrottledMailFailure`, e a mensagem cai na sala de espera de 3.3.
+
+**Lista vazia = conta única `default` usando o `spring.mail.*` autoconfigurado**, para o dev local com MailHog continuar funcionando sem configurar conta nenhuma.
+
+> **Ao subir a segunda instância da aplicação**, troque a implementação do `SendRateLimiter`. O `InMemorySendRateLimiter` conta por processo: duas instâncias contariam 30/min *cada* contra um limite de 30, e o sintoma seria throttling constante e difícil de atribuir. A alternativa sem Redis é particionar — cada instância com sua conta.
+
+**Dimensionamento:** ~10k/dia dá ~7/min de média, folgado nos 30/min. Quem aperta é o limite **diário** de 10.000/caixa: duas contas dão 2x de margem, e é por isso que são duas.
+
+**Rastreabilidade.** A coluna `last_account` guarda a conta da **última tentativa**, em qualquer desfecho — pareia com `last_error`. As três exceções de envio herdam de `MailFailure`, que carrega `account()`; o consumidor grava a partir dela.
+
+| Desfecho | Como `last_account` é preenchido |
+|---|---|
+| `SENT` | `markAsSent(conta)` |
+| `REJECTED` | `markAsRejected(erro, conta)` |
+| `FAILED` (DLQ) | `recordAttemptFailure(conta, erro)` **durante a tentativa** |
+| `FAILED` (teto de throttling) | `recordAttemptFailure` + `markAsFailed()` |
+
+O caso da DLQ é o que exigiu o `recordAttemptFailure`: o `consumeDlq` só recebe o id, e a exceção com a conta já se perdeu. Então a tentativa grava conta e erro **sem mudar o status** (segue `PENDING`), e a DLQ depois só vira a chave com `markAsFailed()`, preservando o diagnóstico. Essa gravação é *best-effort*: se falhar, é logada e o retry segue — registrar diagnóstico nunca pode impedir o reenvio.
+
+Efeito colateral bom: `last_error` passa a trazer o erro real do SMTP em vez de uma mensagem genérica de "esgotou as tentativas".
+
+Contagem diária por conta, usando o índice da migration `V3`:
+
+```sql
+SELECT last_account, count(*)
+  FROM emails
+ WHERE status = 'SENT' AND sent_at >= current_date
+ GROUP BY last_account;
+```
+
+### 3.5. Por que o recoverer ramifica
 
 O `RepublishMessageRecoverer` do Spring tem destino fixo, e o bean `messageRecoverer` vale para **todos** os `@RabbitListener` da aplicação — inclusive o da própria DLQ. Com um destino fixo apontando para a DLQ, uma mensagem que falhasse no `consumeDlq` seria republicada na DLQ, consumida de novo, falharia de novo: loop infinito.
 
@@ -174,7 +243,7 @@ Por isso o bean ramifica pela fila de origem, lida de `getConsumerQueue()`:
 
 Assim uma indisponibilidade momentânea do banco ainda ganha as entregas normais, e só o que é de fato irrecuperável estaciona. `MessageRecovererRoutingTest` cobre os dois caminhos.
 
-### 3.4. Estados
+### 3.6. Estados
 
 ```
                   ┌── markAsSent() ─────▶ SENT      (terminal)
@@ -187,7 +256,7 @@ PENDING ──────────┼── markAsRejected() ─▶ REJECTED
            (exige attempts < MAX_ATTEMPTS)
 ```
 
-`markAsSent`, `markAsFailed` e `markAsRejected` só partem de `PENDING` — chamar qualquer uma sobre um e-mail já processado lança `IllegalStateException`. É a invariante que sustenta a idempotência dos três listeners.
+`markAsSent(conta)`, `markAsFailed()` e `markAsRejected(erro, conta)` só partem de `PENDING` — chamar qualquer uma sobre um e-mail já processado lança `IllegalStateException`. É a invariante que sustenta a idempotência dos três listeners.
 
 `markForRetry()` é a única transição que **não** parte de `PENDING`: exige `FAILED` e `attempts < MAX_ATTEMPTS` (3, constante em `EmailMessage`), incrementa `attempts` e devolve o e-mail a `PENDING`.
 
@@ -198,7 +267,7 @@ PENDING ──────────┼── markAsRejected() ─▶ REJECTED
 | `FAILED` | falha transitória, entregas do ciclo esgotadas | **sim**, até o cap |
 | `REJECTED` | servidor recusou o destinatário | não |
 
-### 3.5. Reenvio
+### 3.7. Reenvio
 
 `FAILED` **não** é fim de linha. Dois gatilhos, ambos passando pelo mesmo `ResendEmailUseCase`:
 
@@ -229,9 +298,9 @@ A regra que sustenta a separação: **o domínio não conhece framework**. Não 
 ## 5. Testes
 
 ```bash
-./mvnw test                                              # 64 unitários, sem infra, ~10s
-./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 8 de integração (exigem Postgres)
-./mvnw test -Dtest.excludedGroups=                       # tudo (72)
+./mvnw test                                              # 85 unitários, sem infra, ~10s
+./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 9 de integração (exigem Postgres)
+./mvnw test -Dtest.excludedGroups=                       # tudo (94)
 ./mvnw test -Dtest=EmailQueueConsumerTest#dlqDeveMarcarComoFalha
 ```
 

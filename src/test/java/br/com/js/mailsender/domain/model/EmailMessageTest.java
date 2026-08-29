@@ -23,7 +23,7 @@ class EmailMessageTest {
 
     private static EmailMessage comStatus(EmailStatus status, int attempts) {
         return EmailMessage.reconstitute(UUID.randomUUID(), TO, "assunto", "corpo", false, List.of(),
-                status, Instant.now(), null, attempts, null);
+                status, Instant.now(), null, null, attempts, null);
     }
 
     @Test
@@ -37,6 +37,7 @@ class EmailMessageTest {
         assertThat(message.getAttachments()).isEmpty();
         assertThat(message.getAttempts()).isEqualTo(1);
         assertThat(message.getLastError()).isNull();
+        assertThat(message.getLastAccount()).isNull();
     }
 
     @Test
@@ -56,10 +57,11 @@ class EmailMessageTest {
     void marcarComoEnviadoDefineStatusEDataDeEnvio() {
         var message = nova();
 
-        message.markAsSent();
+        message.markAsSent("conta-a");
 
         assertThat(message.getStatus()).isEqualTo(EmailStatus.SENT);
         assertThat(message.getSentAt()).isNotNull();
+        assertThat(message.getLastAccount()).isEqualTo("conta-a");
     }
 
     @Test
@@ -67,7 +69,7 @@ class EmailMessageTest {
         var message = comStatus(EmailStatus.FAILED, 1);
         message.markForRetry();
 
-        message.markAsSent();
+        message.markAsSent("conta-a");
 
         assertThat(message.getLastError()).isNull();
     }
@@ -76,10 +78,12 @@ class EmailMessageTest {
     void marcarComoFalhaGuardaOMotivoENaoDefineDataDeEnvio() {
         var message = nova();
 
-        message.markAsFailed("SMTP fora do ar");
+        message.recordAttemptFailure("conta-b", "SMTP fora do ar");
+        message.markAsFailed();
 
         assertThat(message.getStatus()).isEqualTo(EmailStatus.FAILED);
         assertThat(message.getLastError()).isEqualTo("SMTP fora do ar");
+        assertThat(message.getLastAccount()).isEqualTo("conta-b");
         assertThat(message.getSentAt()).isNull();
     }
 
@@ -87,7 +91,7 @@ class EmailMessageTest {
     void deveTruncarErroMuitoLongoParaCaberNaColuna() {
         var message = nova();
 
-        message.markAsFailed("x".repeat(900));
+        message.recordAttemptFailure("conta-a", "x".repeat(900));
 
         assertThat(message.getLastError()).hasSize(500);
     }
@@ -96,10 +100,11 @@ class EmailMessageTest {
     void marcarComoRejeitadoEhTerminal() {
         var message = nova();
 
-        message.markAsRejected("550 usuario inexistente");
+        message.markAsRejected("550 usuario inexistente", "conta-b");
 
         assertThat(message.getStatus()).isEqualTo(EmailStatus.REJECTED);
         assertThat(message.getLastError()).isEqualTo("550 usuario inexistente");
+        assertThat(message.getLastAccount()).isEqualTo("conta-b");
         assertThat(message.isRetriable()).isFalse();
         assertThatThrownBy(message::markForRetry)
                 .isInstanceOf(IllegalStateException.class)
@@ -109,17 +114,44 @@ class EmailMessageTest {
     @Test
     void naoDeveReprocessarMensagemJaFinalizada() {
         var enviado = nova();
-        enviado.markAsSent();
+        enviado.markAsSent("conta-a");
 
-        assertThatThrownBy(enviado::markAsSent)
+        assertThatThrownBy(() -> enviado.markAsSent("conta-a"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("Email already processed");
-        assertThatThrownBy(() -> enviado.markAsFailed("erro"))
+        assertThatThrownBy(enviado::markAsFailed)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("Email already processed");
-        assertThatThrownBy(() -> enviado.markAsRejected("erro"))
+        assertThatThrownBy(() -> enviado.markAsRejected("erro", "conta-a"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("Email already processed");
+        assertThatThrownBy(() -> enviado.recordAttemptFailure("conta-a", "erro"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Email already processed");
+    }
+
+    @Test
+    void registrarTentativaGuardaDiagnosticoSemMudarStatus() {
+        var message = nova();
+
+        message.recordAttemptFailure("conta-b", "SMTP fora do ar");
+
+        // e o que da diagnostico a quem so recebe o id depois, como a DLQ
+        assertThat(message.getStatus()).isEqualTo(EmailStatus.PENDING);
+        assertThat(message.getLastAccount()).isEqualTo("conta-b");
+        assertThat(message.getLastError()).isEqualTo("SMTP fora do ar");
+    }
+
+    @Test
+    void encerrarEmFalhaPreservaODiagnosticoDaTentativa() {
+        var message = nova();
+        message.recordAttemptFailure("conta-b", "SMTP fora do ar");
+
+        message.markAsFailed();
+
+        assertThat(message.getStatus()).isEqualTo(EmailStatus.FAILED);
+        assertThat(message.getLastAccount()).isEqualTo("conta-b");
+        assertThat(message.getLastError()).isEqualTo("SMTP fora do ar");
     }
 
     @Test
@@ -165,7 +197,7 @@ class EmailMessageTest {
 
         var message = EmailMessage.reconstitute(id, TO, "assunto", "corpo", true,
                 List.of(EmailAttachment.fromStorage("doc.txt", "text/plain", "chave/doc.txt")),
-                EmailStatus.SENT, criadoEm, enviadoEm, 2, "erro anterior");
+                EmailStatus.SENT, criadoEm, enviadoEm, "conta-a", 2, "erro anterior");
 
         assertThat(message.getId()).isEqualTo(id);
         assertThat(message.isHtml()).isTrue();
@@ -174,6 +206,7 @@ class EmailMessageTest {
         assertThat(message.getSentAt()).isEqualTo(enviadoEm);
         assertThat(message.getAttempts()).isEqualTo(2);
         assertThat(message.getLastError()).isEqualTo("erro anterior");
+        assertThat(message.getLastAccount()).isEqualTo("conta-a");
         assertThat(message.getAttachments()).singleElement()
                 .satisfies(att -> {
                     assertThat(att.getStoragePath()).isEqualTo("chave/doc.txt");

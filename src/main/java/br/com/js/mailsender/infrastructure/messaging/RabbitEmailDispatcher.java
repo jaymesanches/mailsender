@@ -20,4 +20,19 @@ public class RabbitEmailDispatcher implements EmailDispatcher {
                 RabbitMQConfig.EMAIL_ROUTING_KEY,
                 new EmailEnqueuedEvent(emailId));
     }
+
+    /**
+     * Manda para a sala de espera do throttling. Fora da port de proposito: ciclo de
+     * espera e conceito de mensageria, e o dominio nao precisa conhece-lo.
+     */
+    public void enqueueAfterWait(UUID emailId, int cycle) {
+        rabbitTemplate.convertAndSend(
+                RabbitMQConfig.EMAIL_EXCHANGE,
+                RabbitMQConfig.EMAIL_WAIT_ROUTING_KEY,
+                new EmailEnqueuedEvent(emailId),
+                message -> {
+                    message.getMessageProperties().setHeader(RabbitMQConfig.THROTTLE_CYCLE_HEADER, cycle);
+                    return message;
+                });
+    }
 }

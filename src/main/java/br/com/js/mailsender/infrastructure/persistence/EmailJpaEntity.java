@@ -43,6 +43,9 @@ public class EmailJpaEntity {
     private Instant createdAt;
     private Instant sentAt;
 
+    @Column(length = 100)
+    private String lastAccount;
+
     @Column(nullable = false)
     private int attempts;
 

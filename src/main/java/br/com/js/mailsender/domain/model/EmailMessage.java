@@ -22,6 +22,7 @@ public class EmailMessage {
     private EmailStatus status;
     private final Instant createdAt;
     private Instant sentAt;
+    private String lastAccount;
     private int attempts;
     private String lastError;
 
@@ -40,7 +41,7 @@ public class EmailMessage {
     // Private constructor for reconstitution
     private EmailMessage(UUID id, Email to, String subject, String body, boolean html,
             List<EmailAttachment> attachments, EmailStatus status, Instant createdAt, Instant sentAt,
-            int attempts, String lastError) {
+            String lastAccount, int attempts, String lastError) {
         this.id = id;
         this.to = to;
         this.subject = subject;
@@ -50,6 +51,7 @@ public class EmailMessage {
         this.status = status;
         this.createdAt = createdAt;
         this.sentAt = sentAt;
+        this.lastAccount = lastAccount;
         this.attempts = attempts;
         this.lastError = lastError;
     }
@@ -61,29 +63,40 @@ public class EmailMessage {
 
     public static EmailMessage reconstitute(UUID id, Email to, String subject, String body, boolean html,
             List<EmailAttachment> attachments, EmailStatus status, Instant createdAt, Instant sentAt,
-            int attempts, String lastError) {
+            String lastAccount, int attempts, String lastError) {
         return new EmailMessage(id, to, subject, body, html, attachments, status, createdAt, sentAt,
-                attempts, lastError);
+                lastAccount, attempts, lastError);
     }
 
-    public void markAsSent() {
+    public void markAsSent(String account) {
         requirePending();
         this.status = EmailStatus.SENT;
         this.sentAt = Instant.now();
+        this.lastAccount = account;
         this.lastError = null;
     }
 
-    /** Falha transitoria: continua reenviavel enquanto houver tentativa disponivel. */
-    public void markAsFailed(String error) {
+    /**
+     * Guarda conta e motivo da tentativa **sem** mudar o status. E o que da
+     * diagnostico a quem so recebe o id depois, como o consumidor da DLQ.
+     */
+    public void recordAttemptFailure(String account, String error) {
         requirePending();
-        this.status = EmailStatus.FAILED;
+        this.lastAccount = account;
         this.lastError = truncate(error);
     }
 
+    /** Encerra em FALHA preservando o diagnostico registrado pelas tentativas. */
+    public void markAsFailed() {
+        requirePending();
+        this.status = EmailStatus.FAILED;
+    }
+
     /** Falha permanente: terminal, nunca reenviado. */
-    public void markAsRejected(String error) {
+    public void markAsRejected(String error, String account) {
         requirePending();
         this.status = EmailStatus.REJECTED;
+        this.lastAccount = account;
         this.lastError = truncate(error);
     }
 

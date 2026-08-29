@@ -39,7 +39,7 @@ class ResendEmailUseCaseTest {
 
     private static EmailMessage comStatus(UUID id, EmailStatus status, int attempts) {
         return EmailMessage.reconstitute(id, Email.of("dest@example.com"), "assunto", "corpo", false,
-                List.of(), status, Instant.now(), null, attempts, "erro anterior");
+                List.of(), status, Instant.now(), null, null, attempts, "erro anterior");
     }
 
     @Test
