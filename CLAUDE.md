@@ -40,7 +40,7 @@ Nenhum arquivo com valores reais é versionado: `.gitignore` ignora `.env*`, e `
 
 `application-backup.txt` guarda uma versão anterior do yml com defaults inline — é a melhor referência dos valores esperados de cada variável.
 
-O storage de anexos é lido de `ceph.*` (`S3StorageConfig`); o bloco `minio:` do `application.yml` está **órfão** — nenhum código o lê. Ao apontar para MinIO local, preencha as `CEPH_*`.
+O storage de anexos é lido de `ceph.*` (`S3StorageConfig`), independente do backend: o adapter fala S3 com `forcePathStyle`, que serve tanto para Ceph RGW quanto para o MinIO local. Ao apontar para o MinIO do compose, preencha as `CEPH_*` — não existe bloco `minio:` (era órfão e foi removido).
 
 ## Arquitetura
 
@@ -108,6 +108,18 @@ Dois gatilhos de reenvio, ambos no `ResendEmailUseCase`: `POST /api/v1/emails/{i
 Flyway com `baseline-on-migrate=true`; migrations em `src/main/resources/db/migration` (`V1__Initial_setup.sql`). Toda mudança de schema é migration nova — `ddl-auto=none`. O pom tem dependências Oracle/`flyway-database-oracle` comentadas: o projeto foi escrito para trocar de banco, evite SQL específico de Postgres nas migrations sem necessidade.
 
 `EmailJpaRepository.findById` usa `@EntityGraph(attributePaths = "attachments")` para evitar lazy-loading fora de transação no consumer.
+
+## Deploy
+
+`.gitlab-ci.yml` (testa, depois constrói) + `Dockerfile` + `compose.deploy.yaml` (servidor puxa a imagem por `:$CI_COMMIT_SHORT_SHA`). RabbitMQ, Ceph e Postgres são provisionados fora. `compose.yaml` da raiz é só infra local de dev — o deploy nunca o usa. `MANUAL.md` §8 tem o detalhe.
+
+**A imagem não compila**: consome o jar de `target/`, produzido pelo job `package` (um único `mvnw package` roda os 118 unitários e empacota). Logo `docker build .` exige `./mvnw package` antes, e o `.dockerignore` libera só `target/*.jar`. Não reintroduza Maven no `Dockerfile` — dentro do DinD não há cache do `.m2`.
+
+Três coisas a não desfazer: no Boot 4 a extração em camadas é `-Djarmode=tools` (`layertools` não existe mais, e roda em JRE); `tmpfs /tmp` é obrigatório com `read_only`, porque `file-size-threshold=0` grava todo upload em disco; e `TZ` no compose importa porque o cron do expurgo usa o timezone da JVM.
+
+`.dockerignore` barra `.env*` — sem isso as credenciais entrariam numa camada publicada.
+
+No CI os testes de integração ficam **desligados** (`RUN_INTEGRATION_TESTS=true` liga): exigem Postgres e runner de executor docker/kubernetes — em executor shell o `services` é ignorado sem aviso. Consequência: migration quebrada só aparece no deploy, então rodar a suíte de integração localmente antes do MR é disciplina. Quando ligado, o job sobrescreve `SPRING_DATASOURCE_URL` porque o service atende no alias `postgres`, não em `localhost` como está no `application-test.properties`. E `mvnw` precisa continuar com modo `100755` no git: sem o bit de execução, `./mvnw` falha no runner Linux.
 
 ## Cuidados ao editar
 

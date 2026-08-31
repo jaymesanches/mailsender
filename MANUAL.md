@@ -40,10 +40,9 @@ Quem carrega o arquivo é a lib `spring-dotenv`, e ela lê **somente `.env`**. U
 | `RABBITMQ_*` | conexão com o broker |
 | `MAIL_*` | servidor SMTP de saída |
 | `SPRING_DATASOURCE_*`, `SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT` | Postgres (datasource, JPA e Flyway) |
-| `CEPH_*` | storage de anexos — **é o que o código lê** |
-| `MINIO_*` | bloco órfão: nenhuma classe lê `minio.*` hoje |
+| `CEPH_*` | storage de anexos (Ceph RGW ou MinIO — o adapter fala S3 com os dois) |
 
-> Para apontar o storage ao MinIO local do compose, preencha as `CEPH_*` com `http://localhost:9000` e `minioadmin`. O `S3StorageConfig` fala S3 com `forcePathStyle`, que serve para os dois.
+> Para apontar o storage ao MinIO local do compose, preencha as `CEPH_*` com `http://localhost:9000` e `minioadmin`. O `S3StorageConfig` usa `forcePathStyle`, que serve para os dois.
 
 ### 1.3. Rodar
 
@@ -156,7 +155,7 @@ A numeração continua a da seção anterior, porque é o mesmo fluxo.
 | 15 | O retry é do listener Spring: `max-retries: 3` significa **4 entregas** (1 inicial + 3 retries), com intervalos de 3s, 6s e 10s — ver 3.2 |
 | 16 | Esgotadas as tentativas, o `messageRecoverer` republica em `emails.dlq.key`, caindo em `emails.send.dlq` |
 | 17 | `consumeDlq` marca **`FAILED`**. Ele **nunca propaga exceção**: id inexistente é logado e descartado; status já processado é ignorado |
-| 18 | Se o próprio `consumeDlq` falhar (banco fora, por exemplo) e esgotar as entregas, a mensagem vai para `emails.send.parking`, cujo consumidor **só alerta** — ver §8 |
+| 18 | Se o próprio `consumeDlq` falhar (banco fora, por exemplo) e esgotar as entregas, a mensagem vai para `emails.send.parking`, cujo consumidor **só alerta** — ver §9 |
 | 19 | Falha **permanente** (destinatário recusado pelo servidor) não passa por nada disso: `consume` encerra em `REJECTED` na hora, sem retry e sem DLQ |
 | 20 | Falha por **throttling** (`4.x.x`) também sai da escada: vai para `emails.send.wait`, espera ~60s e volta — sem tocar em `status` nem `attempts`. Ver 4.1 |
 
@@ -405,7 +404,98 @@ Os testes de integração levam `@Tag("integration")`, que o surefire exclui por
 
 ---
 
-## 8. Operação e pontos de atenção
+## 8. Deploy
+
+RabbitMQ, Ceph e Postgres são provisionados fora deste projeto. O deploy sobe **somente a aplicação** e a aponta para eles pelo `.env`.
+
+Três artefatos, com donos diferentes:
+
+| Arquivo | Quem usa |
+|---|---|
+| `.gitlab-ci.yml` | o GitLab, para testar e disparar o build |
+| `Dockerfile` | o build, para construir a imagem |
+| `.dockerignore` | o build, para o `.env` não entrar numa camada de imagem |
+| `compose.deploy.yaml` | o servidor, para subir a imagem publicada |
+
+> `compose.yaml` na raiz é outra coisa: infra efêmera de desenvolvimento local (§1.1). O deploy nunca o usa.
+
+### 8.1. A imagem
+
+**A imagem não compila.** Ela consome o jar já construído em `target/`, produzido pelo job `package`. Antes o `Dockerfile` rodava Maven de novo dentro do DinD — a compilação mais cara do pipeline, porque lá o cache do `.m2` não existe.
+
+Consequência a conhecer: `docker build .` sozinho não funciona num checkout limpo. Rode `./mvnw package -DskipTests` antes. Se esquecer, o `COPY target/*.jar` falha com sintoma explícito.
+
+Os dois estágios usam **`eclipse-temurin:25-jre`**, sem JDK em nenhum ponto: o `jarmode=tools` roda só com `java.base` e `java.logging` (verificado com `--limit-modules`). Mesma tag nos dois estágios significa uma imagem baixada, não duas.
+
+O passo que vale o esforço é a extração em camadas:
+
+```dockerfile
+RUN java -Djarmode=tools -jar target/*.jar extract --layers --launcher --destination extracted
+```
+
+O fat jar tem ~77MB, e as dependências não mudam entre releases. Separando as camadas, cada build publica só a última (as classes da aplicação, ~70KB) em vez de 77MB.
+
+> No Boot 4 o modo é **`tools`**. O antigo `-Djarmode=layertools` não existe mais.
+
+O `.dockerignore` libera **somente** `target/*.jar` de dentro de `target/`, e barra `src/`, `pom.xml` e o wrapper — a imagem não precisa de nada disso. O `.jar.original` não casa com `*.jar` e fica de fora.
+
+A imagem roda como `USER 1001:1001`, sem `useradd` nem `chown -R` — um chown recursivo duplicaria os 77MB numa camada nova, e o processo só precisa de leitura em `/app`.
+
+### 8.2. O pipeline
+
+Dois estágios, e **a aplicação é compilada uma única vez**:
+
+| Job | O que faz |
+|---|---|
+| `package` | um `mvnw package` compila, roda os **118 unitários** e produz o jar |
+| `image` | consome o jar como artifact, constrói e publica; roda **só** no branch default e em tags |
+| `test:integration` | os 12 tagueados; **desligado por padrão** — ver abaixo |
+
+O jar só existe se os testes unitários passarem, então não há como publicar imagem de build reprovado. O job publica `reports: junit`, então o resultado aparece direto no merge request.
+
+**Os testes de integração não rodam por padrão.** Eles exigem Postgres, e o `surefire` já os exclui via `test.excludedGroups` — o job `package` simplesmente não desfaz esse filtro, e por isso roda em qualquer executor de runner.
+
+Para ligá-los, defina `RUN_INTEGRATION_TESTS=true` nas variáveis do projeto. Duas coisas a saber antes:
+
+- **Exige runner de executor `docker` ou `kubernetes`.** O `services: postgres:17-alpine` faz o *GitLab* subir um Postgres descartável para aquele job — não é preciso ter Postgres instalado em servidor nenhum. Em executor **shell** o bloco `services` é ignorado sem aviso e o job falha na conexão.
+- **Recompila a aplicação**, porque é um job separado do `package` (que precisa rodar sem infraestrutura). É o segundo compile do pipeline, e só existe quando ligado.
+
+> Com integração desligada, uma migration quebrada só aparece **no deploy**, quando o Flyway roda contra o banco real. Rodar `./mvnw test -Dtest.excludedGroups= -Dgroups=integration` localmente antes de abrir MR passa a ser disciplina, não conveniência.
+
+Dois pontos não óbvios:
+
+**O host do banco muda no CI.** `application-test.properties` aponta para `localhost`, que não existe no runner — o service atende no alias `postgres`. O job de integração sobrescreve com a variável `SPRING_DATASOURCE_URL`, que tem precedência sobre o arquivo de properties. Quando ligado, ele traz um ganho além dos testes: as migrations `V1..V5` são aplicadas num banco vazio, validando o caminho de instalação limpa.
+
+**`--cache-from` não é otimização opcional.** O DinD começa do zero a cada pipeline; sem ele a separação em camadas do Dockerfile ajudaria apenas no push/pull, não no tempo de build. O job puxa a `:latest` antes de construir justamente para reaproveitar as camadas.
+
+**Tags publicadas:** sempre `:$CI_COMMIT_SHORT_SHA` (imutável, é a que permite rollback e a que vai em `MAILSENDER_IMAGE`), mais `:latest` no branch default e `:$CI_COMMIT_TAG` quando houver tag git.
+
+> Se o runner não permitir `privileged` (necessário para DinD), troque o job por kaniko ou buildah — o `Dockerfile` não muda.
+
+### 8.3. O compose do servidor
+
+```bash
+docker compose -f compose.deploy.yaml pull
+docker compose -f compose.deploy.yaml up -d
+docker compose -f compose.deploy.yaml logs -f
+```
+
+Ao lado do arquivo precisa existir um `.env` com as variáveis de `.envsample`, mais `MAILSENDER_IMAGE` apontando para a tag publicada. **O mesmo `.env` serve a dois propósitos**: o compose o lê sozinho para interpolar `${MAILSENDER_IMAGE}`, e o `env_file` injeta tudo no container.
+
+Quatro escolhas do compose que não são enfeite:
+
+| Ajuste | Por quê |
+|---|---|
+| `TZ: America/Sao_Paulo` | o cron do expurgo usa o timezone da JVM; em UTC o `0 30 3 * * *` dispararia **00:30** no horário local |
+| `tmpfs: /tmp` | **obrigatório** com `read_only: true`: `file-size-threshold=0` faz o Spring gravar todo upload em disco antes de ler. 256m cobre ~14 uploads de 18MB simultâneos |
+| healthcheck TCP | não exige `curl` na imagem e, de propósito, **não** reinicia a aplicação porque o Postgres caiu — reiniciar não consertaria o banco. Contexto que falha mata o processo e fecha a porta, e aí reiniciar ajuda |
+| `ExitOnOutOfMemoryError` | com anexo de 18MB por thread o estouro é plausível; morrer e reiniciar é melhor que degradar em silêncio |
+
+**Sobre `mem_limit: 1g`:** é ponto de partida, não conta fechada. `MaxRAMPercentage=75` dá ~768MB de heap, contra um pior caso realista de ~5 consumidores × 18MB mais buffers de download e threads de request. Cabe, sem folga generosa — observe o consumo real antes de fixar.
+
+---
+
+## 9. Operação e pontos de atenção
 
 **Filas.** Inspecione no management UI (`localhost:15672`). Mensagem em `emails.send.parking` é sinal de problema grave: a aplicação não conseguiu nem registrar a falha, então o status no banco não é confiável. O consumidor da parking **só loga em ERROR** e deliberadamente **não altera status** — naquele ponto não se sabe se o e-mail saiu, e marcar `FAILED` mandaria o reenvio duplicar uma entrega. A decisão é humana: confirme no servidor de e-mail e, se não saiu, use o endpoint de reenvio.
 

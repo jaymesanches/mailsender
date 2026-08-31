@@ -1,0 +1,61 @@
+# Deploy no servidor. RabbitMQ, Ceph e Postgres sao provisionados fora daqui —
+# este compose sobe somente a aplicacao e a aponta para eles pelo .env.
+#
+#   docker compose -f compose.deploy.yaml pull
+#   docker compose -f compose.deploy.yaml up -d
+#
+# O compose.yaml da raiz e outra coisa: infra efemera para desenvolvimento local.
+
+name: mailsender
+
+services:
+  mailsender:
+    image: ${MAILSENDER_IMAGE:?defina MAILSENDER_IMAGE no .env}
+    restart: unless-stopped
+
+    # O mesmo .env serve a dois propositos: o compose o le sozinho para interpolar
+    # ${MAILSENDER_IMAGE} acima, e o env_file injeta as variaveis no container.
+    # `.envsample` continua sendo o contrato de quais variaveis existem.
+    env_file:
+      - .env
+
+    environment:
+      # O cron do expurgo usa o timezone da JVM. Sem TZ o container roda em UTC e
+      # "0 30 3 * * *" dispara 00:30 no horario local — nao e o que o operador espera.
+      TZ: America/Sao_Paulo
+
+      # A JVM le o limite do cgroup, entao MaxRAMPercentage respeita o mem_limit.
+      # Morrer no OOM e melhor que degradar: o restart devolve o servico, e um
+      # anexo de 18MB por thread torna o estouro plausivel.
+      JAVA_TOOL_OPTIONS: >-
+        -XX:MaxRAMPercentage=75
+        -XX:+ExitOnOutOfMemoryError
+
+    ports:
+      - "8081:8081"
+
+    mem_limit: 1g
+
+    read_only: true
+    tmpfs:
+      # Obrigatorio, nao endurecimento opcional: com file-size-threshold=0 o Spring
+      # grava TODO upload em disco antes de a aplicacao ler, e o Tomcat quer work dir.
+      # 256m cobre alguns uploads de 18MB simultaneos.
+      - /tmp:size=256m
+
+    healthcheck:
+      # Checagem TCP em vez de /actuator/health: nao exige curl na imagem e, de
+      # proposito, nao reinicia a aplicacao so porque o Postgres esta fora — reiniciar
+      # nao consertaria o banco. Se o contexto do Spring falha, o processo morre e a
+      # porta fecha, que e o caso em que reiniciar ajuda.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8081'"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

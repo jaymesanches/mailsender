@@ -1,0 +1,31 @@
+# Segredos: nunca podem entrar numa camada de imagem
+.env
+.env-*
+
+# De target/ entra somente o fat jar, que e o que a imagem consome.
+# O .jar.original nao casa com *.jar e continua de fora.
+target/*
+!target/*.jar
+
+# Fonte: a imagem nao compila, entao nada disso e usado
+src/
+pom.xml
+mvnw
+mvnw.cmd
+.mvn/
+
+# Controle de versao e IDE
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+*.iml
+
+# Docs, infra local e requests de teste
+*.md
+compose.yaml
+compose.deploy.yaml
+.gitlab-ci.yml
+api.http
+.agent/
