@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Component;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -41,6 +42,15 @@ public class EmailJpaAdapter implements EmailRepository {
     @Override
     public List<UUID> findRetriableIds(int limit) {
         return repository.findRetriableIds(EmailStatus.FAILED, EmailMessage.MAX_ATTEMPTS, Limit.of(limit));
+    }
+
+    @Override
+    public List<UUID> findPurgeableIds(Instant antesDe, int limit) {
+        return repository.findPurgeableIds(antesDe,
+                List.of(EmailStatus.SENT, EmailStatus.REJECTED),
+                EmailStatus.FAILED,
+                EmailMessage.MAX_ATTEMPTS,
+                Limit.of(limit));
     }
 
     private EmailJpaEntity toEntity(EmailMessage domain) {

@@ -189,6 +189,54 @@ class EmailMessageTest {
         assertThat(comStatus(EmailStatus.FAILED, EmailMessage.MAX_ATTEMPTS - 1).isRetriable()).isTrue();
     }
 
+    @ParameterizedTest
+    @EnumSource(value = EmailStatus.class, names = { "SENT", "REJECTED" })
+    void terminalEhExpurgavel(EmailStatus status) {
+        assertThat(comStatus(status, 1).isPurgeable()).isTrue();
+    }
+
+    @Test
+    void pendenteNaoEhExpurgavel() {
+        assertThat(nova().isPurgeable()).isFalse();
+    }
+
+    @Test
+    void falhaReenviavelNaoEhExpurgavel() {
+        // apagar o anexo aqui quebraria o reenvio, que nao re-sobe nada
+        assertThat(comStatus(EmailStatus.FAILED, 1).isPurgeable()).isFalse();
+    }
+
+    @Test
+    void falhaComTentativasEsgotadasEhExpurgavel() {
+        assertThat(comStatus(EmailStatus.FAILED, EmailMessage.MAX_ATTEMPTS).isPurgeable()).isTrue();
+    }
+
+    @Test
+    void expurgarAnexosZeraOsCaminhosDoStorage() {
+        var message = EmailMessage.reconstitute(UUID.randomUUID(), TO, "assunto", "corpo", false,
+                List.of(EmailAttachment.fromStorage("doc.txt", "text/plain", "chave/doc.txt")),
+                EmailStatus.SENT, Instant.now(), Instant.now(), "conta-a", 1, null);
+
+        message.markAttachmentsPurged();
+
+        assertThat(message.getAttachments()).singleElement()
+                .satisfies(att -> assertThat(att.getStoragePath()).isNull());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = EmailStatus.class, names = { "PENDING" })
+    void expurgoRecusaOQuePodeSerEnviado(EmailStatus status) {
+        var pendente = comStatus(status, 1);
+        assertThatThrownBy(pendente::markAttachmentsPurged)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("ainda pode ser enviado");
+
+        var reenviavel = comStatus(EmailStatus.FAILED, 1);
+        assertThatThrownBy(reenviavel::markAttachmentsPurged)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("ainda pode ser enviado");
+    }
+
     @Test
     void reconstituteDevePreservarOEstadoPersistido() {
         var id = UUID.randomUUID();

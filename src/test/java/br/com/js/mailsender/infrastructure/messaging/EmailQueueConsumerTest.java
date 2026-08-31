@@ -10,6 +10,7 @@ import br.com.js.mailsender.domain.model.TransientMailFailure;
 import br.com.js.mailsender.domain.ports.AttachmentStorageGateway;
 import br.com.js.mailsender.domain.ports.EmailGateway;
 import br.com.js.mailsender.domain.ports.EmailRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -19,6 +20,7 @@ import org.mockito.Captor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.amqp.AmqpException;
 
 import java.time.Instant;
@@ -55,6 +57,13 @@ class EmailQueueConsumerTest {
 
     @Captor
     private ArgumentCaptor<EmailMessage> enviado;
+
+    private static final int MAX_CICLOS = 10;
+
+    @BeforeEach
+    void configurarTeto() {
+        ReflectionTestUtils.setField(consumer, "maxThrottleCycles", MAX_CICLOS);
+    }
 
     /** Como o adapter JPA devolve: anexo com storagePath e sem bytes. */
     private static EmailMessage pendenteComAnexo(UUID id) {
@@ -186,7 +195,7 @@ class EmailQueueConsumerTest {
         doThrow(new ThrottledMailFailure("432 4.3.2", "conta-b", new RuntimeException()))
                 .when(emailGateway).send(any());
 
-        consumer.consume(new EmailEnqueuedEvent(id), EmailQueueConsumer.MAX_THROTTLE_CYCLES);
+        consumer.consume(new EmailEnqueuedEvent(id), MAX_CICLOS);
 
         // nao volta para a espera: registra e entra no fluxo de reenvio
         verifyNoInteractions(dispatcher);
@@ -252,6 +261,22 @@ class EmailQueueConsumerTest {
         assertThat(message.isRetriable()).isTrue();
         verify(emailRepository).save(message);
         verifyNoInteractions(emailGateway, storageGateway);
+    }
+
+    @Test
+    void anexoExpurgadoEncerraEmRejectedSemNullPointer() {
+        var id = UUID.randomUUID();
+        var message = EmailMessage.reconstitute(id, Email.of("dest@example.com"), "assunto", "corpo", false,
+                List.of(EmailAttachment.fromStorage("doc.txt", "text/plain", null)),
+                EmailStatus.PENDING, Instant.now(), null, null, 1, null);
+        when(emailRepository.findById(id)).thenReturn(Optional.of(message));
+
+        consumer.consume(new EmailEnqueuedEvent(id), null);
+
+        assertThat(message.getStatus()).isEqualTo(EmailStatus.REJECTED);
+        assertThat(message.getLastError()).contains("expurgado");
+        verifyNoInteractions(storageGateway, emailGateway);
+        verify(emailRepository).save(message);
     }
 
     @Test

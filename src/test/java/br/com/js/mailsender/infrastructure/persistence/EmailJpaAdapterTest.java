@@ -20,6 +20,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -40,6 +41,9 @@ class EmailJpaAdapterTest {
 
     @Captor
     private ArgumentCaptor<Limit> limitCaptor;
+
+    @Captor
+    private ArgumentCaptor<List<EmailStatus>> statusCaptor;
 
     @Test
     void saveDeveMapearDominioParaEntidadeComRetrovinculoDoAnexo() {
@@ -115,6 +119,22 @@ class EmailJpaAdapterTest {
         verify(repository).findRetriableIds(eq(EmailStatus.FAILED), eq(EmailMessage.MAX_ATTEMPTS),
                 limitCaptor.capture());
         assertThat(limitCaptor.getValue().max()).isEqualTo(10);
+    }
+
+    @Test
+    void findPurgeableIdsDeveFiltrarTerminaisAnterioresAoCorte() {
+        var corte = Instant.parse("2026-01-01T00:00:00Z");
+        var esperados = List.of(UUID.randomUUID());
+        when(repository.findPurgeableIds(eq(corte), anyList(), eq(EmailStatus.FAILED),
+                eq(EmailMessage.MAX_ATTEMPTS), any(Limit.class))).thenReturn(esperados);
+
+        var ids = adapter.findPurgeableIds(corte, 50);
+
+        assertThat(ids).isEqualTo(esperados);
+        verify(repository).findPurgeableIds(eq(corte), statusCaptor.capture(), eq(EmailStatus.FAILED),
+                eq(EmailMessage.MAX_ATTEMPTS), limitCaptor.capture());
+        assertThat(statusCaptor.getValue()).containsExactlyInAnyOrder(EmailStatus.SENT, EmailStatus.REJECTED);
+        assertThat(limitCaptor.getValue().max()).isEqualTo(50);
     }
 
     private static EmailJpaEntity entidadeEnviada(UUID id) {

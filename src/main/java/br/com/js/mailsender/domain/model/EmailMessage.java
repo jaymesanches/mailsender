@@ -117,6 +117,24 @@ public class EmailMessage {
         return this.status == EmailStatus.FAILED && this.attempts < MAX_ATTEMPTS;
     }
 
+    /** Os bytes so podem sair do storage quando o e-mail nunca mais sera enviado. */
+    public boolean isPurgeable() {
+        return this.status != EmailStatus.PENDING && !isRetriable();
+    }
+
+    /**
+     * storagePath nulo passa a significar "bytes expurgados": o anexo existiu e nao
+     * esta mais la. A guarda aqui e a rede que impede uma query errada de soltar os
+     * bytes de um e-mail que o reenvio ainda alcancaria.
+     */
+    public void markAttachmentsPurged() {
+        if (!isPurgeable()) {
+            throw new IllegalStateException(
+                    "Email ainda pode ser enviado: " + this.status + "/" + this.attempts);
+        }
+        this.attachments.forEach(attachment -> attachment.setStoragePath(null));
+    }
+
     private void requirePending() {
         if (this.status != EmailStatus.PENDING) {
             throw new IllegalStateException("Email already processed");

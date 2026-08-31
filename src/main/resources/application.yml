@@ -58,6 +58,12 @@ ceph:
 mailsender:
   throttle:
     max-cycles: 10
+  purge:
+    # expurgo e irreversivel: desligue por aqui, sem deploy
+    enabled: true
+    cron: "0 11 8 * * *"
+    retention-days: 1 #90
+    batch-size: 200
   accounts:
     - name: mailhog - externo
       host: smtp.mailhog.site

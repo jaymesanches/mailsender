@@ -1,6 +1,7 @@
 package br.com.js.mailsender.infrastructure.messaging;
 
 import org.springframework.amqp.AmqpException;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
@@ -22,7 +23,8 @@ import lombok.extern.slf4j.Slf4j;
 public class EmailQueueConsumer {
 
     /** Depois disso o throttling deixou de ser pico: vira falha registrada. */
-    static final int MAX_THROTTLE_CYCLES = 10;
+    @Value("${mailsender.throttle.max-cycles:10}")
+    private int maxThrottleCycles;
 
     private final EmailRepository emailRepository;
     private final EmailGateway emailGateway;
@@ -84,7 +86,7 @@ public class EmailQueueConsumer {
             Integer throttleCycle, ThrottledMailFailure e) {
         int ciclo = throttleCycle == null ? 0 : throttleCycle;
 
-        if (ciclo >= MAX_THROTTLE_CYCLES) {
+        if (ciclo >= maxThrottleCycles) {
             log.error("Email {} throttled apos {} ciclos de espera. Registrando como falha.",
                     event.emailId(), ciclo);
             emailMessage.recordAttemptFailure(e.account(),
@@ -135,8 +137,16 @@ public class EmailQueueConsumer {
 
     private EmailMessage withAttachmentContent(EmailMessage emailMessage) {
         var attachmentsWithContent = emailMessage.getAttachments().stream()
-                .map(att -> new EmailAttachment(att.getName(), att.getContentType(),
-                        storageGateway.download(att.getStoragePath()), att.getStoragePath()))
+                .map(att -> {
+                    // expurgado: falhar explicito e melhor que estourar NPE em laco de
+                    // retry ou mandar calado um e-mail que prometia anexo
+                    if (att.getStoragePath() == null) {
+                        throw new PermanentMailFailure(
+                                "Anexo " + att.getName() + " ja foi expurgado do storage", null, null);
+                    }
+                    return new EmailAttachment(att.getName(), att.getContentType(),
+                            storageGateway.download(att.getStoragePath()), att.getStoragePath());
+                })
                 .toList();
 
         return EmailMessage.reconstitute(

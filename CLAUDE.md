@@ -81,6 +81,14 @@ Cada conta recebe timeouts de SMTP por padrão (`connectiontimeout` 5s, `timeout
 
 `MailAccountPool` loga um WARN no boot (`Controle de taxa EM MEMORIA`) enquanto o limiter de memória estiver ativo e houver limite real — não apague sem trocar a implementação. `InMemorySendRateLimiter` conta **por processo**: ao passar de uma instância, trocar por implementação distribuída ou particionar contas por instância, senão o limite do provedor estoura.
 
+### Expurgo de anexos
+
+Job diário (`PurgeAttachmentsJob`, `mailsender.purge.*`) apaga os bytes do storage 90 dias após `created_at` e anula o `storagePath`; a linha de `emails` fica. Corte por `created_at` porque `sent_at` é nulo em `FAILED`/`REJECTED`.
+
+**A invariante mora no agregado**: `EmailMessage.isPurgeable()` = não-`PENDING` e não-retentável. Nunca expurgue por query sozinha — o reenvio não re-sobe anexo, então soltar bytes de e-mail ainda reenviável o quebra em silêncio. `PurgeAttachmentsUseCase` checa antes de apagar qualquer byte e apaga **storage primeiro, banco depois** (a ordem inversa deixaria bytes órfãos).
+
+`storagePath` nulo = bytes expurgados; o consumidor encerra em `REJECTED` se topar com isso.
+
 ### Estados e reenvio
 
 `PENDING → SENT | FAILED | REJECTED`, e essas três transições só partem de `PENDING`. A quarta, `markForRetry()`, é a exceção: exige `FAILED` **e** `attempts < EmailMessage.MAX_ATTEMPTS` (3), incrementa `attempts` e devolve a `PENDING`.

@@ -289,7 +289,37 @@ PENDING ──────────┼── markAsRejected() ─▶ REJECTED
 | `FAILED` | falha transitória, entregas do ciclo esgotadas | **sim**, até o cap |
 | `REJECTED` | servidor recusou o destinatário | não |
 
-### 3.7. Reenvio
+### 3.7. Expurgo dos anexos
+
+Os bytes saem do storage **90 dias** após `created_at` (`mailsender.purge.retention-days`), num job diário de madrugada. A linha de `emails` **fica** — o que custa são os bytes; o registro de quem recebeu o quê é auditoria barata.
+
+O corte é por `created_at` e não `sent_at` porque `sent_at` é nulo em `FAILED` e `REJECTED`, e o expurgo precisa alcançar os três terminais.
+
+| Estado | Expurgável |
+|---|---|
+| `PENDING` | não |
+| `FAILED` com tentativa disponível | **não** — ainda reenviável |
+| `FAILED` com tentativas esgotadas | sim |
+| `SENT` / `REJECTED` | sim |
+
+A regra mora no agregado (`EmailMessage.isPurgeable`), não só na query: o reenvio **não re-sobe anexo**, então soltar os bytes de um e-mail ainda alcançável pelo reenvio o quebraria silenciosamente — o erro só apareceria muito depois, quando alguém acionasse o endpoint.
+
+**`storagePath` nulo significa "bytes expurgados"**: o anexo existiu e não está mais lá. Se um e-mail nesse estado voltar a ser consumido (só acontece virando o status na mão no banco), o consumidor encerra em `REJECTED` com "anexo já expurgado" — falhar explícito é melhor que mandar calado um e-mail que prometia anexo.
+
+A ordem dentro do use case é **storage primeiro, banco depois**. Se o delete falhar, o `storagePath` sobrevive apontando para bytes que ainda existem e a rodada seguinte tenta de novo; na ordem inversa o ponteiro sumiria e os bytes ficariam órfãos para sempre.
+
+```yaml
+mailsender:
+  purge:
+    enabled: true          # expurgo e irreversivel: desligue por aqui, sem deploy
+    cron: "0 30 3 * * *"
+    retention-days: 90
+    batch-size: 200
+```
+
+> Não há varredura reversa do bucket: objeto sem registro no banco (upload que deu certo com save que falhou) não é alcançado por este expurgo.
+
+### 3.8. Reenvio
 
 `FAILED` **não** é fim de linha. Dois gatilhos, ambos passando pelo mesmo `ResendEmailUseCase`:
 
@@ -320,9 +350,9 @@ A regra que sustenta a separação: **o domínio não conhece framework**. Não 
 ## 5. Testes
 
 ```bash
-./mvnw test                                              # 93 unitários, sem infra, ~10s
-./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 9 de integração (exigem Postgres)
-./mvnw test -Dtest.excludedGroups=                       # tudo (102)
+./mvnw test                                              # 114 unitários, sem infra, ~10s
+./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 11 de integração (exigem Postgres)
+./mvnw test -Dtest.excludedGroups=                       # tudo (125)
 ./mvnw test -Dtest=EmailQueueConsumerTest#dlqDeveMarcarComoFalha
 ```
 

@@ -10,6 +10,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
@@ -36,6 +37,9 @@ class S3AttachmentStorageAdapterTest {
     @Captor
     private ArgumentCaptor<GetObjectRequest> getCaptor;
 
+    @Captor
+    private ArgumentCaptor<DeleteObjectRequest> deleteCaptor;
+
     @Test
     void uploadDeveUsarChavePrefixadaPeloEmailIdEDevolverOCaminho() {
         var emailId = UUID.randomUUID();
@@ -47,6 +51,15 @@ class S3AttachmentStorageAdapterTest {
         verify(s3Client).putObject(putCaptor.capture(), any(RequestBody.class));
         assertThat(putCaptor.getValue().bucket()).isEqualTo("mail-attachments");
         assertThat(putCaptor.getValue().key()).isEqualTo(path);
+    }
+
+    @Test
+    void deleteDeveApagarPelaChaveNoBucketCerto() {
+        adapter.delete("chave/doc.txt");
+
+        verify(s3Client).deleteObject(deleteCaptor.capture());
+        assertThat(deleteCaptor.getValue().bucket()).isEqualTo("mail-attachments");
+        assertThat(deleteCaptor.getValue().key()).isEqualTo("chave/doc.txt");
     }
 
     @Test

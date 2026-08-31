@@ -1,5 +1,6 @@
 package br.com.js.mailsender.integration;
 
+import br.com.js.mailsender.application.usecases.PurgeAttachmentsUseCase;
 import br.com.js.mailsender.domain.model.EmailMessage.EmailStatus;
 import br.com.js.mailsender.domain.model.PermanentMailFailure;
 import br.com.js.mailsender.domain.model.ThrottledMailFailure;
@@ -20,6 +21,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.context.WebApplicationContext;
@@ -31,6 +33,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -55,6 +58,9 @@ class EmailAsyncFlowIntegrationTest {
 
     @Autowired
     private EmailQueueConsumer emailQueueConsumer;
+
+    @Autowired
+    private PurgeAttachmentsUseCase purgeAttachmentsUseCase;
 
     @MockitoBean
     private EmailGateway emailGateway;
@@ -185,6 +191,45 @@ class EmailAsyncFlowIntegrationTest {
     }
 
     @Test
+    void expurgoDeveApagarOsBytesEZerarOCaminhoMantendoORegistro() throws Exception {
+        var emailId = postEmailComAnexo("Test Purge Subject");
+        emailQueueConsumer.consume(new EmailEnqueuedEvent(emailId), null);
+        assertThat(emailRepository.findById(emailId).orElseThrow().getStatus()).isEqualTo(EmailStatus.SENT);
+
+        purgeAttachmentsUseCase.execute(emailId);
+
+        verify(storageGateway).delete("chave/doc.txt");
+        var expurgado = emailRepository.findById(emailId).orElseThrow();
+        // o registro sobrevive para auditoria; so os bytes saem
+        assertThat(expurgado.getStatus()).isEqualTo(EmailStatus.SENT);
+        assertThat(expurgado.getAttachments()).singleElement()
+                .satisfies(att -> assertThat(att.getStoragePath()).isNull());
+    }
+
+    @Test
+    void expurgoNaoPodeTocarEmEmailAindaReenviavel() throws Exception {
+        doThrow(new TransientMailFailure("SMTP fora do ar", "conta-b", new RuntimeException()))
+                .when(emailGateway).send(any());
+
+        var emailId = postEmailComAnexo("Test Purge Safety");
+        var event = new EmailEnqueuedEvent(emailId);
+        assertThatThrownBy(() -> emailQueueConsumer.consume(event, null)).isInstanceOf(AmqpException.class);
+        emailQueueConsumer.consumeDlq(event);
+
+        var falhado = emailRepository.findById(emailId).orElseThrow();
+        assertThat(falhado.isRetriable()).isTrue();
+
+        assertThatThrownBy(() -> purgeAttachmentsUseCase.execute(emailId))
+                .isInstanceOf(IllegalStateException.class);
+
+        // o anexo continua no storage: o reenvio depende dele
+        verify(storageGateway, never()).delete(any());
+        assertThat(emailRepository.findById(emailId).orElseThrow().getAttachments())
+                .singleElement()
+                .satisfies(att -> assertThat(att.getStoragePath()).isEqualTo("chave/doc.txt"));
+    }
+
+    @Test
     void reenvioDeEmailInexistenteDeveResponder404() throws Exception {
         mockMvc.perform(post("/api/v1/emails/{id}/reenvio", UUID.randomUUID()))
                 .andExpect(status().isNotFound());
@@ -197,6 +242,23 @@ class EmailAsyncFlowIntegrationTest {
                 .param("subject", "assunto")
                 .param("body", "corpo"))
                 .andExpect(status().isBadRequest());
+    }
+
+    private UUID postEmailComAnexo(String subject) throws Exception {
+        when(storageGateway.upload(any(), any(), any())).thenReturn("chave/doc.txt");
+
+        MvcResult result = mockMvc.perform(multipart("/api/v1/emails")
+                .file(new MockMultipartFile("attachments", "doc.txt", "text/plain", "conteudo".getBytes()))
+                .param("to", "test@example.com")
+                .param("subject", subject)
+                .param("body", "corpo")
+                .param("isHtml", "false"))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        var location = result.getResponse().getHeader("Location");
+        assertThat(location).isNotNull();
+        return UUID.fromString(location.substring(location.lastIndexOf('/') + 1));
     }
 
     private UUID postEmail(String subject) throws Exception {
