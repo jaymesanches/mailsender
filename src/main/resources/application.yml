@@ -3,6 +3,12 @@ server:
 spring:
   application:
     name: mailsender
+  servlet:
+    multipart:
+      # guarda externa, folgada de proposito: quem fala e o limite derivado em
+      # mailsender.attachments, com mensagem explicando o porque
+      max-file-size: 20MB
+      max-request-size: 22MB
   rabbitmq:
     listener:
       simple:
@@ -56,6 +62,9 @@ ceph:
   secret-key: ${CEPH_SECRET_KEY}
 
 mailsender:
+  attachments:
+    # limite de mensagem do provedor; o orcamento de bytes crus e ~1/1.37 disso
+    max-message-size: 25MB
   throttle:
     max-cycles: 10
   purge:

@@ -236,6 +236,20 @@ class EmailAsyncFlowIntegrationTest {
     }
 
     @Test
+    void anexoAcimaDoLimiteDeveResponder413() throws Exception {
+        // 19MB crus: passa da guarda do Spring (20MB) e bate no orcamento derivado (~18MB)
+        var grande = new MockMultipartFile("attachments", "grande.bin",
+                "application/octet-stream", new byte[19 * 1024 * 1024]);
+
+        mockMvc.perform(multipart("/api/v1/emails")
+                .file(grande)
+                .param("to", "test@example.com")
+                .param("subject", "assunto")
+                .param("body", "corpo"))
+                .andExpect(status().isPayloadTooLarge());
+    }
+
+    @Test
     void destinatarioInvalidoDeveResponder400() throws Exception {
         mockMvc.perform(multipart("/api/v1/emails")
                 .param("to", "nao-e-email")

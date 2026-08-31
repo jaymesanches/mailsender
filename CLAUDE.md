@@ -55,6 +55,10 @@ Camadas em `br.com.js.mailsender`:
 
 Bytes nunca trafegam pela fila nem pelo banco: o evento carrega só o `emailId`; o banco guarda `storage_path` (chave `{emailId}/{filename}` no bucket `mail-attachments`, hardcoded em `S3AttachmentStorageAdapter`); o consumer rehidrata os bytes via `storageGateway.download` e monta um `EmailMessage.reconstitute` temporário só para o gateway SMTP.
 
+**Tamanho.** `mailsender.attachments.max-message-size` é o limite do **provedor** (25MB, o número do admin center), não o do upload: `AttachmentProperties.maxRawAttachmentBytes()` divide por `encodingOverhead` (1.37) porque o Exchange limita a mensagem MIME codificada e base64 infla 1/3. Dá ~18MB de bytes crus. Não troque isso por um 18MB cravado — o derivado acompanha quando o admin libera mais.
+
+`SendEmailUseCase.validarTamanho` checa a **soma** com `getSize()` **antes** de `getBytes()`, para não alocar o anexo só para descartar, e lança `AttachmentTooLargeException` → 413. `spring.servlet.multipart` (20MB/22MB) é só a guarda de memória externa, folgada de propósito para que a mensagem explicativa venha do use case; `MaxUploadSizeExceededException` também vira 413 no `ApiExceptionHandler` (sem o handler seria 500).
+
 ### Mensageria
 
 `DirectExchange emails.exchange` com quatro filas: `emails.send.queue` (`emails.send.key`), DLQ `emails.send.dlq` (`emails.dlq.key`), parking `emails.send.parking` (`emails.parking.key`) e espera `emails.send.wait` (`emails.wait.key`, TTL 60s + DLX de volta para a principal).
@@ -69,7 +73,7 @@ Alterar nomes/argumentos de fila em `RabbitMQConfig` não recria filas existente
 
 O provedor (Exchange Online) limita ~30 msg/min e ~10.000 destinatários/dia **por caixa**. `SpringEmailGateway` classifica pela classe do código estendido (RFC 3463): `4.x.x` → `ThrottledMailFailure`, `5.x.x` ou `getInvalidAddresses()` não vazio → `PermanentMailFailure`, sem código estendido → `TransientMailFailure`.
 
-**Throttling não é falha do e-mail.** O consumidor manda para `emails.send.wait` (TTL 60s, DLX devolve à fila principal) e **não toca em `status` nem em `attempts`**. O contador de ciclos vai no header `x-throttle-cycle`; passando de `EmailQueueConsumer.MAX_THROTTLE_CYCLES` (10) vira `FAILED`, que é reenviável. Nunca reintroduza throttling na escada de retry: ela se esgota em 19s e um limite por minuto precisa de ~60s.
+**Throttling não é falha do e-mail.** O consumidor manda para `emails.send.wait` (TTL 60s, DLX devolve à fila principal) e **não toca em `status` nem em `attempts`**. O contador de ciclos vai no header `x-throttle-cycle`; passando de `mailsender.throttle.max-cycles` (default 10, `@Value` no consumidor) vira `FAILED`, que é reenviável. Nunca reintroduza throttling na escada de retry: ela se esgota em 19s e um limite por minuto precisa de ~60s.
 
 Contas são intercambiáveis: **uma fila, consumidores concorrentes**, nunca fila por conta. `MailAccountPool.acquire()` roda um índice rotativo e consulta o `SendRateLimiter` (janela de 60s por conta); vazio → `ThrottledMailFailure`. `mailsender.accounts[]` vazio cai no `spring.mail.*` autoconfigurado como conta `default` (dev local com MailHog).
 

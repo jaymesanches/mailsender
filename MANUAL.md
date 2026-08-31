@@ -96,7 +96,7 @@ flowchart TD
 |---|---|---|
 | 1 | `POST /api/v1/emails` com `multipart/form-data`, ligado ao record `SendEmailRequest(to, subject, body, isHtml, attachments)` via `@ModelAttribute` | `EmailController.java:25` |
 | 2 | `Email.of(to)` valida contra regex e normaliza: `trim()` e depois `toLowerCase()`. Inválido → `IllegalArgumentException` | `Email.java` |
-| 3 | Cada `MultipartFile` vira um `EmailAttachment.fromUpload`, com os bytes em memória | `SendEmailUseCase.java` |
+| 3 | Valida a **soma** dos anexos contra o orçamento derivado do limite do provedor (ver 2.3); passando, cada `MultipartFile` vira um `EmailAttachment.fromUpload` com os bytes em memória | `SendEmailUseCase.java` |
 | 4 | `EmailMessage.create(...)` nasce **`PENDING`**, com UUID gerado e `createdAt` | `EmailMessage.java` |
 | 5 | Para cada anexo: `upload(emailId, nome, bytes)` → chave `{emailId}/{filename}` no bucket `mail-attachments`; a chave volta e é gravada no `storagePath` do anexo | `S3AttachmentStorageAdapter.java` |
 | 6 | `saveAndFlush` do agregado, mapeado para `EmailJpaEntity` + `EmailAttachmentJpaEntity` | `EmailJpaAdapter.java` |
@@ -117,6 +117,33 @@ flowchart TD
 
 Os bytes do anexo **nunca** trafegam pela fila nem são gravados no banco. A fila leva um UUID; o banco leva o `storagePath`. É o que mantém a mensagem pequena e o banco enxuto, ao custo de o consumidor precisar de um round-trip ao storage.
 
+### 2.3. Limite de tamanho dos anexos
+
+O provedor limita a **mensagem MIME codificada**, não os bytes crus do anexo. Base64 infla os dados em 1/3, e ainda entram quebras de linha a cada 76 caracteres e os cabeçalhos das partes. Por isso o que se configura é o limite do provedor, e o orçamento de bytes aceitos na API é derivado dele:
+
+```yaml
+mailsender:
+  attachments:
+    max-message-size: 25MB    # o numero que aparece no admin center do M365
+```
+
+`25MB ÷ 1.37 ≈ 18MB` de anexo cru. Configurar 25MB no upload faria a API responder `201` e o Exchange rejeitar depois com `552` → `REJECTED` assíncrono, sem o cliente saber por quê. O limite derivado recusa na porta.
+
+Se o admin liberar mais no tenant (o Exchange vai até 150MB), troque `max-message-size` — o orçamento acompanha.
+
+**São duas camadas, com propósitos distintos:**
+
+| Camada | Valor | Para quê |
+|---|---|---|
+| `spring.servlet.multipart` | 20MB/arquivo, 22MB/request | guarda de memória: barra upload absurdo antes de chegar ao use case |
+| `mailsender.attachments` | ~18MB de **soma** | regra de negócio, com mensagem explicando o cálculo |
+
+A externa é folgada de propósito, para que quem fale seja a interna: a resposta diz *"anexos somam 20,0 MB, acima do limite de 18,2 MB"* em vez do erro genérico do Spring. As duas respondem **413**.
+
+> O limite vale para a **soma**, não por arquivo — dois anexos de 10MB são recusados mesmo cada um estando abaixo do teto, porque é o total que o provedor enxerga.
+
+A validação usa `MultipartFile.getSize()` e acontece **antes** de `getBytes()`: sem isso, 18MB seriam alocados só para serem descartados. `SendEmailUseCaseTest` fixa isso com `verify(grande, never()).getBytes()`.
+
 ---
 
 ## 3. Quando dá errado
@@ -129,11 +156,11 @@ A numeração continua a da seção anterior, porque é o mesmo fluxo.
 | 15 | O retry é do listener Spring: `max-retries: 3` significa **4 entregas** (1 inicial + 3 retries), com intervalos de 3s, 6s e 10s — ver 3.2 |
 | 16 | Esgotadas as tentativas, o `messageRecoverer` republica em `emails.dlq.key`, caindo em `emails.send.dlq` |
 | 17 | `consumeDlq` marca **`FAILED`**. Ele **nunca propaga exceção**: id inexistente é logado e descartado; status já processado é ignorado |
-| 18 | Se o próprio `consumeDlq` falhar (banco fora, por exemplo) e esgotar as entregas, a mensagem vai para `emails.send.parking`, cujo consumidor **só alerta** — ver §6 |
+| 18 | Se o próprio `consumeDlq` falhar (banco fora, por exemplo) e esgotar as entregas, a mensagem vai para `emails.send.parking`, cujo consumidor **só alerta** — ver §8 |
 | 19 | Falha **permanente** (destinatário recusado pelo servidor) não passa por nada disso: `consume` encerra em `REJECTED` na hora, sem retry e sem DLQ |
-| 20 | Falha por **throttling** (`4.x.x`) também sai da escada: vai para `emails.send.wait`, espera ~60s e volta — sem tocar em `status` nem `attempts`. Ver 3.3 |
+| 20 | Falha por **throttling** (`4.x.x`) também sai da escada: vai para `emails.send.wait`, espera ~60s e volta — sem tocar em `status` nem `attempts`. Ver 4.1 |
 
-### 3.1. Topologia
+### 3.1. Topologia das filas
 
 `DirectExchange emails.exchange`, com quatro filas:
 
@@ -165,7 +192,67 @@ Durante todo esse período (~19s) o registro permanece `PENDING`.
 
 **O retry é `stateless` (default) e bloqueia a thread.** A mensagem não volta ao broker entre as tentativas: o próprio consumidor espera. Com `concurrency: 2` e `prefetch: 1`, um SMTP fora do ar prende as duas threads por ~19s cada, e a vazão cai para ~2 e-mails por 19 segundos enquanto a fila cresce. É o sintoma a procurar quando a `emails.send.queue` começa a acumular.
 
-### 3.3. Throttling: esperar em vez de retentar
+### 3.3. Por que o recoverer ramifica
+
+O `RepublishMessageRecoverer` do Spring tem destino fixo, e o bean `messageRecoverer` vale para **todos** os `@RabbitListener` da aplicação — inclusive o da própria DLQ. Com um destino fixo apontando para a DLQ, uma mensagem que falhasse no `consumeDlq` seria republicada na DLQ, consumida de novo, falharia de novo: loop infinito.
+
+Por isso o bean ramifica pela fila de origem, lida de `getConsumerQueue()`:
+
+- falha vinda de `emails.send.queue` → DLQ;
+- falha vinda de `emails.send.dlq` → parking.
+
+Assim uma indisponibilidade momentânea do banco ainda ganha as entregas normais, e só o que é de fato irrecuperável estaciona. `MessageRecovererRoutingTest` cobre os dois caminhos.
+
+### 3.4. Estados
+
+```
+                  ┌── markAsSent() ─────▶ SENT      (terminal)
+                  │
+PENDING ──────────┼── markAsRejected() ─▶ REJECTED  (terminal)
+    ▲             │
+    │             └── markAsFailed() ───▶ FAILED
+    │                                       │
+    └───── markForRetry() ◀──────────────────┘
+           (exige attempts < MAX_ATTEMPTS)
+```
+
+`markAsSent(conta)`, `markAsFailed()` e `markAsRejected(erro, conta)` só partem de `PENDING` — chamar qualquer uma sobre um e-mail já processado lança `IllegalStateException`. É a invariante que sustenta a idempotência dos três listeners.
+
+`markForRetry()` é a única transição que **não** parte de `PENDING`: exige `FAILED` e `attempts < MAX_ATTEMPTS` (3, constante em `EmailMessage`), incrementa `attempts` e devolve o e-mail a `PENDING`.
+
+| Status | Significado | Reenviável |
+|---|---|---|
+| `PENDING` | na fila ou em processamento | — |
+| `SENT` | servidor aceitou a mensagem | não |
+| `FAILED` | falha transitória, entregas do ciclo esgotadas | **sim**, até o cap |
+| `REJECTED` | servidor recusou o destinatário | não |
+
+### 3.5. Reenvio
+
+`FAILED` **não** é fim de linha. Dois gatilhos, ambos passando pelo mesmo `ResendEmailUseCase`:
+
+- **`POST /api/v1/emails/{id}/reenvio`** → `202 Accepted`. Responde `409 Conflict` se o e-mail não estiver `FAILED` ou já tiver esgotado as tentativas, e `404` se não existir.
+- **`RetryFailedEmailsJob`**, a cada `mailsender.retry.interval` (default 60s), varre até `mailsender.retry.batch-size` (default 50) e reenfileira. Um id problemático é logado e não aborta o lote.
+
+O reenvio **não re-sobe anexo**: o `storagePath` gravado segue válido, porque não há rotina de limpeza do bucket.
+
+O que impede reenvio indevido: `markForRetry` só sai de `FAILED`, a guarda do `consume` só age em `PENDING`, `MAX_ATTEMPTS` fecha o loop e `REJECTED` fica fora da query do job.
+
+---
+
+## 4. Capacidade e limites do provedor
+
+O Exchange Online impõe três limites, e cada um morde numa escala diferente:
+
+| Limite | Valor típico | Onde é tratado |
+|---|---|---|
+| Tamanho da mensagem | 25MB codificada | **2.3** — recusa na porta com `413` |
+| Mensagens por minuto | 30 por caixa | **4.1** — fila de espera de 60s |
+| Destinatários por dia | 10.000 por caixa | **4.2** — dimensionamento com duas contas |
+
+Confirme os números no seu tenant: variam por licença e a Microsoft os altera.
+
+### 4.1. Throttling: esperar em vez de retentar
 
 O servidor de envio (Exchange Online) limita **~30 mensagens/minuto por caixa** e **~10.000 destinatários/dia**. Ao estourar, responde algo como:
 
@@ -185,9 +272,9 @@ Isso **não é falha do e-mail** — é falta de capacidade naquele instante. Tr
 
 O e-mail throttled vai para `emails.send.wait`, que **não tem consumidor**: a mensagem expira pelo TTL de 60s e o dead-letter a devolve para a fila principal — o mesmo mecanismo da DLQ, invertido, sem plugin nenhum.
 
-**Enquanto espera, nada muda no banco**: nem `status`, nem `attempts`. Um contador de ciclos viaja no header `x-throttle-cycle`; ao passar de `MAX_THROTTLE_CYCLES` (10, ~10 minutos) o e-mail deixa de ser pico e vira `FAILED` — que é reenviável pelo fluxo de 3.6.
+**Enquanto espera, nada muda no banco**: nem `status`, nem `attempts`. Um contador de ciclos viaja no header `x-throttle-cycle`; ao passar de `mailsender.throttle.max-cycles` (10, ~10 minutos) o e-mail deixa de ser pico e vira `FAILED` — que é reenviável pelo fluxo de 3.5.
 
-### 3.4. Pool de contas
+### 4.2. Pool de contas
 
 Como as contas são intercambiáveis (existem só para somar capacidade), há **uma fila e consumidores concorrentes**, não fila por conta — assim uma conta ociosa ajuda a drenar o trabalho da outra.
 
@@ -202,7 +289,7 @@ mailsender:
       max-per-minute: 30
 ```
 
-`MailAccountPool.acquire()` percorre as contas a partir de um índice rotativo e devolve a primeira com permit no `SendRateLimiter` (janela deslizante de 60s por conta). Nenhuma disponível → `ThrottledMailFailure`, e a mensagem cai na sala de espera de 3.3.
+`MailAccountPool.acquire()` percorre as contas a partir de um índice rotativo e devolve a primeira com permit no `SendRateLimiter` (janela deslizante de 60s por conta). Nenhuma disponível → `ThrottledMailFailure`, e a mensagem cai na sala de espera de 4.1.
 
 **Timeouts vêm por padrão**, e não são opcionais por acaso: sem eles o JavaMail espera para sempre, e um host que aceita a conexão TCP mas não responde prende a thread do consumidor — nada estoura, nem o retry nem a fila de espera entram em ação, e a vazão simplesmente para.
 
@@ -254,42 +341,9 @@ SELECT last_account, count(*)
  GROUP BY last_account;
 ```
 
-### 3.5. Por que o recoverer ramifica
+---
 
-O `RepublishMessageRecoverer` do Spring tem destino fixo, e o bean `messageRecoverer` vale para **todos** os `@RabbitListener` da aplicação — inclusive o da própria DLQ. Com um destino fixo apontando para a DLQ, uma mensagem que falhasse no `consumeDlq` seria republicada na DLQ, consumida de novo, falharia de novo: loop infinito.
-
-Por isso o bean ramifica pela fila de origem, lida de `getConsumerQueue()`:
-
-- falha vinda de `emails.send.queue` → DLQ;
-- falha vinda de `emails.send.dlq` → parking.
-
-Assim uma indisponibilidade momentânea do banco ainda ganha as entregas normais, e só o que é de fato irrecuperável estaciona. `MessageRecovererRoutingTest` cobre os dois caminhos.
-
-### 3.6. Estados
-
-```
-                  ┌── markAsSent() ─────▶ SENT      (terminal)
-                  │
-PENDING ──────────┼── markAsRejected() ─▶ REJECTED  (terminal)
-    ▲             │
-    │             └── markAsFailed() ───▶ FAILED
-    │                                       │
-    └───── markForRetry() ◀──────────────────┘
-           (exige attempts < MAX_ATTEMPTS)
-```
-
-`markAsSent(conta)`, `markAsFailed()` e `markAsRejected(erro, conta)` só partem de `PENDING` — chamar qualquer uma sobre um e-mail já processado lança `IllegalStateException`. É a invariante que sustenta a idempotência dos três listeners.
-
-`markForRetry()` é a única transição que **não** parte de `PENDING`: exige `FAILED` e `attempts < MAX_ATTEMPTS` (3, constante em `EmailMessage`), incrementa `attempts` e devolve o e-mail a `PENDING`.
-
-| Status | Significado | Reenviável |
-|---|---|---|
-| `PENDING` | na fila ou em processamento | — |
-| `SENT` | servidor aceitou a mensagem | não |
-| `FAILED` | falha transitória, entregas do ciclo esgotadas | **sim**, até o cap |
-| `REJECTED` | servidor recusou o destinatário | não |
-
-### 3.7. Expurgo dos anexos
+## 5. Expurgo dos anexos
 
 Os bytes saem do storage **90 dias** após `created_at` (`mailsender.purge.retention-days`), num job diário de madrugada. A linha de `emails` **fica** — o que custa são os bytes; o registro de quem recebeu o quê é auditoria barata.
 
@@ -319,20 +373,9 @@ mailsender:
 
 > Não há varredura reversa do bucket: objeto sem registro no banco (upload que deu certo com save que falhou) não é alcançado por este expurgo.
 
-### 3.8. Reenvio
-
-`FAILED` **não** é fim de linha. Dois gatilhos, ambos passando pelo mesmo `ResendEmailUseCase`:
-
-- **`POST /api/v1/emails/{id}/reenvio`** → `202 Accepted`. Responde `409 Conflict` se o e-mail não estiver `FAILED` ou já tiver esgotado as tentativas, e `404` se não existir.
-- **`RetryFailedEmailsJob`**, a cada `mailsender.retry.interval` (default 60s), varre até `mailsender.retry.batch-size` (default 50) e reenfileira. Um id problemático é logado e não aborta o lote.
-
-O reenvio **não re-sobe anexo**: o `storagePath` gravado segue válido, porque não há rotina de limpeza do bucket.
-
-O que impede reenvio indevido: `markForRetry` só sai de `FAILED`, a guarda do `consume` só age em `PENDING`, `MAX_ATTEMPTS` fecha o loop e `REJECTED` fica fora da query do job.
-
 ---
 
-## 4. Mapa do código
+## 6. Mapa do código
 
 Pacote raiz `br.com.js.mailsender`.
 
@@ -347,12 +390,12 @@ A regra que sustenta a separação: **o domínio não conhece framework**. Não 
 
 ---
 
-## 5. Testes
+## 7. Testes
 
 ```bash
-./mvnw test                                              # 114 unitários, sem infra, ~10s
-./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 11 de integração (exigem Postgres)
-./mvnw test -Dtest.excludedGroups=                       # tudo (125)
+./mvnw test                                              # 118 unitários, sem infra, ~10s
+./mvnw test -Dtest.excludedGroups= -Dgroups=integration  # 12 de integração (exigem Postgres)
+./mvnw test -Dtest.excludedGroups=                       # tudo (130)
 ./mvnw test -Dtest=EmailQueueConsumerTest#dlqDeveMarcarComoFalha
 ```
 
@@ -362,7 +405,7 @@ Os testes de integração levam `@Tag("integration")`, que o surefire exclui por
 
 ---
 
-## 6. Operação e pontos de atenção
+## 8. Operação e pontos de atenção
 
 **Filas.** Inspecione no management UI (`localhost:15672`). Mensagem em `emails.send.parking` é sinal de problema grave: a aplicação não conseguiu nem registrar a falha, então o status no banco não é confiável. O consumidor da parking **só loga em ERROR** e deliberadamente **não altera status** — naquele ponto não se sabe se o e-mail saiu, e marcar `FAILED` mandaria o reenvio duplicar uma entrega. A decisão é humana: confirme no servidor de e-mail e, se não saiu, use o endpoint de reenvio.
 
