@@ -52,7 +52,7 @@ class MailAccountPoolTest {
 
     @Test
     void deveAvisarNoBootQueOLimiteEmMemoriaValePorProcesso() {
-        new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured);
+        new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured, "");
 
         assertThat(avisouSobreLimiteEmMemoria()).isTrue();
     }
@@ -60,7 +60,7 @@ class MailAccountPoolTest {
     @Test
     void naoDeveAvisarQuandoNaoHaLimiteParaFurar() {
         // conta default de desenvolvimento nao tem teto: o aviso seria ruido
-        new MailAccountPool(new MailSenderProperties(), limiter, autoconfigured);
+        new MailAccountPool(new MailSenderProperties(), limiter, autoconfigured, "");
 
         assertThat(avisouSobreLimiteEmMemoria()).isFalse();
     }
@@ -69,7 +69,7 @@ class MailAccountPoolTest {
     void naoDeveAvisarComLimiterDistribuido() {
         SendRateLimiter distribuido = (conta, max) -> true;
 
-        new MailAccountPool(comContas(30, "conta-a"), distribuido, autoconfigured);
+        new MailAccountPool(comContas(30, "conta-a"), distribuido, autoconfigured, "");
 
         // o aviso se desliga sozinho ao trocar a implementacao
         assertThat(avisouSobreLimiteEmMemoria()).isFalse();
@@ -86,7 +86,7 @@ class MailAccountPoolTest {
         interno.setStartTls(false);
         props.setAccounts(List.of(interno));
 
-        var conta = new MailAccountPool(props, limiter, autoconfigured).acquire().orElseThrow();
+        var conta = new MailAccountPool(props, limiter, autoconfigured, "").acquire().orElseThrow();
 
         var javaMail = ((JavaMailSenderImpl) conta.sender()).getJavaMailProperties();
         assertThat(javaMail).containsEntry("mail.smtp.auth", "false")
@@ -95,7 +95,7 @@ class MailAccountPoolTest {
 
     @Test
     void oDefaultEhAuthEStartTlsLigadosPorCausaDoExchange() {
-        var conta = new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured)
+        var conta = new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured, "")
                 .acquire().orElseThrow();
 
         var javaMail = ((JavaMailSenderImpl) conta.sender()).getJavaMailProperties();
@@ -105,7 +105,7 @@ class MailAccountPoolTest {
 
     @Test
     void deveAplicarTimeoutsPadraoParaNaoPendurarAThreadDoConsumidor() {
-        var conta = new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured)
+        var conta = new MailAccountPool(comContas(30, "conta-a"), limiter, autoconfigured, "")
                 .acquire().orElseThrow();
 
         var javaMail = ((JavaMailSenderImpl) conta.sender()).getJavaMailProperties();
@@ -125,7 +125,7 @@ class MailAccountPoolTest {
                 "mail.smtp.ssl.trust", "smtp.example.com"));
         props.setAccounts(List.of(conta));
 
-        var escolhida = new MailAccountPool(props, limiter, autoconfigured).acquire().orElseThrow();
+        var escolhida = new MailAccountPool(props, limiter, autoconfigured, "").acquire().orElseThrow();
 
         var javaMail = ((JavaMailSenderImpl) escolhida.sender()).getJavaMailProperties();
         assertThat(javaMail).containsEntry("mail.smtp.timeout", "30000")
@@ -150,6 +150,51 @@ class MailAccountPoolTest {
                         .containsEntry("mail.smtp.timeout", "7000"));
     }
 
+    private static MailSenderProperties.Account contaCom(String nome, String username,
+            String from, String fromName) {
+        var conta = new MailSenderProperties.Account();
+        conta.setName(nome);
+        conta.setHost("smtp.example.com");
+        conta.setUsername(username);
+        conta.setFrom(from);
+        conta.setFromName(fromName);
+        return conta;
+    }
+
+    private static MailAccountPool poolCom(MailSenderProperties.Account conta,
+            SendRateLimiter limiter, JavaMailSender autoconfigured) {
+        var props = new MailSenderProperties();
+        props.setAccounts(List.of(conta));
+        return new MailAccountPool(props, limiter, autoconfigured, "");
+    }
+
+    @Test
+    void remetenteVazioCaiNoUsername() {
+        // no Exchange a caixa autenticada so pode enviar como ela mesma
+        var conta = poolCom(contaCom("pmo", "protocolo@osasco.sp.gov.br", null, null),
+                limiter, autoconfigured).acquire().orElseThrow();
+
+        assertThat(conta.from()).isEqualTo("protocolo@osasco.sp.gov.br");
+    }
+
+    @Test
+    void remetenteExplicitoVenceOUsername() {
+        var conta = poolCom(contaCom("pmo", "protocolo@osasco.sp.gov.br",
+                "naoresponda@osasco.sp.gov.br", "Prefeitura"), limiter, autoconfigured)
+                .acquire().orElseThrow();
+
+        assertThat(conta.from()).isEqualTo("naoresponda@osasco.sp.gov.br");
+        assertThat(conta.fromName()).isEqualTo("Prefeitura");
+    }
+
+    @Test
+    void semContaConfiguradaOFromVemDoSpringMail() {
+        var pool = new MailAccountPool(new MailSenderProperties(), limiter, autoconfigured,
+                "protocolo@mailhog.com");
+
+        assertThat(pool.acquire().orElseThrow().from()).isEqualTo("protocolo@mailhog.com");
+    }
+
     private static MailSenderProperties comContas(int maxPerMinute, String... nomes) {
         var props = new MailSenderProperties();
         props.setAccounts(List.of(nomes).stream().map(nome -> {
@@ -164,7 +209,7 @@ class MailAccountPoolTest {
 
     @Test
     void semContasConfiguradasUsaOSenderAutoconfigurado() {
-        var pool = new MailAccountPool(new MailSenderProperties(), limiter, autoconfigured);
+        var pool = new MailAccountPool(new MailSenderProperties(), limiter, autoconfigured, "");
 
         var conta = pool.acquire().orElseThrow();
 
@@ -174,7 +219,7 @@ class MailAccountPoolTest {
 
     @Test
     void deveAlternarEntreAsContasParaEspalharACarga() {
-        var pool = new MailAccountPool(comContas(10, "conta-a", "conta-b"), limiter, autoconfigured);
+        var pool = new MailAccountPool(comContas(10, "conta-a", "conta-b"), limiter, autoconfigured, "");
 
         var primeira = pool.acquire().orElseThrow().name();
         var segunda = pool.acquire().orElseThrow().name();
@@ -185,7 +230,7 @@ class MailAccountPoolTest {
 
     @Test
     void deveCairNaOutraContaQuandoAPrimeiraEstaNoLimite() {
-        var pool = new MailAccountPool(comContas(1, "conta-a", "conta-b"), limiter, autoconfigured);
+        var pool = new MailAccountPool(comContas(1, "conta-a", "conta-b"), limiter, autoconfigured, "");
 
         assertThat(pool.acquire()).isPresent();
         assertThat(pool.acquire()).isPresent();
@@ -193,7 +238,7 @@ class MailAccountPoolTest {
 
     @Test
     void deveDevolverVazioQuandoTodasAsContasEstaoNoLimite() {
-        var pool = new MailAccountPool(comContas(1, "conta-a", "conta-b"), limiter, autoconfigured);
+        var pool = new MailAccountPool(comContas(1, "conta-a", "conta-b"), limiter, autoconfigured, "");
 
         pool.acquire();
         pool.acquire();
@@ -204,7 +249,7 @@ class MailAccountPoolTest {
 
     @Test
     void deveVoltarAAtenderQuandoAJanelaDesliza() {
-        var pool = new MailAccountPool(comContas(1, "conta-a"), limiter, autoconfigured);
+        var pool = new MailAccountPool(comContas(1, "conta-a"), limiter, autoconfigured, "");
         pool.acquire();
         assertThat(pool.acquire()).isEmpty();
 

@@ -8,12 +8,13 @@ import br.com.js.mailsender.domain.ports.EmailGateway;
 import jakarta.mail.MessagingException;
 import jakarta.mail.SendFailedException;
 import jakarta.mail.internet.MimeMessage;
+
+import java.io.UnsupportedEncodingException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.mail.MailException;
 import org.springframework.mail.MailSendException;
-import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.stereotype.Component;
 
@@ -37,8 +38,8 @@ public class SpringEmailGateway implements EmailGateway {
 
         MimeMessage message;
         try {
-            message = build(account.sender(), emailMessage);
-        } catch (MessagingException e) {
+            message = build(account, emailMessage);
+        } catch (MessagingException | UnsupportedEncodingException e) {
             // mensagem malformada: retentar nao muda o resultado
             throw new PermanentMailFailure("Failed to construct email message", account.name(), e);
         }
@@ -55,10 +56,21 @@ public class SpringEmailGateway implements EmailGateway {
         return account.name();
     }
 
-    private MimeMessage build(JavaMailSender javaMailSender, EmailMessage emailMessage) throws MessagingException {
-        MimeMessage message = javaMailSender.createMimeMessage();
+    private MimeMessage build(MailAccount account, EmailMessage emailMessage)
+            throws MessagingException, UnsupportedEncodingException {
+        MimeMessage message = account.sender().createMimeMessage();
         boolean hasAttachments = emailMessage.getAttachments() != null && !emailMessage.getAttachments().isEmpty();
         MimeMessageHelper helper = new MimeMessageHelper(message, hasAttachments, "UTF-8");
+
+        // Sem isto o JavaMail deriva o remetente do usuario do SO e o Exchange recusa
+        // com SendAsDenied: a caixa autenticada nao pode enviar como outro endereco.
+        if (account.from() != null && !account.from().isBlank()) {
+            if (account.fromName() != null && !account.fromName().isBlank()) {
+                helper.setFrom(account.from(), account.fromName());
+            } else {
+                helper.setFrom(account.from());
+            }
+        }
 
         helper.setTo(emailMessage.getTo().value());
         helper.setSubject(emailMessage.getSubject());

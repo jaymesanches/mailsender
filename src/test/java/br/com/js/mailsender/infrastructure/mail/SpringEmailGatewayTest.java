@@ -13,6 +13,7 @@ import jakarta.mail.internet.MimeMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mail.MailSendException;
@@ -27,6 +28,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -47,13 +49,41 @@ class SpringEmailGatewayTest {
     void setUp() {
         gateway = new SpringEmailGateway(accountPool);
         lenient().when(accountPool.acquire())
-                .thenReturn(Optional.of(new MailAccount("conta-a", javaMailSender, 30)));
+                .thenReturn(Optional.of(new MailAccount("conta-a", javaMailSender, 30, "protocolo@osasco.sp.gov.br", null)));
         lenient().when(javaMailSender.createMimeMessage()).thenReturn(new MimeMessage((Session) null));
     }
 
     private void servidorResponde(Exception falha) {
         doThrow(new MailSendException(Map.<Object, Exception>of("msg", falha)))
                 .when(javaMailSender).send(any(MimeMessage.class));
+    }
+
+    @Test
+    void deveDefinirORemetenteDaConta() throws Exception {
+        // sem isto o JavaMail deriva o remetente do usuario do SO e o Exchange
+        // recusa com "SendAsDenied"
+        var enviada = ArgumentCaptor.forClass(MimeMessage.class);
+
+        gateway.send(MESSAGE);
+
+        verify(javaMailSender).send(enviada.capture());
+        assertThat(enviada.getValue().getFrom()).hasSize(1);
+        assertThat(enviada.getValue().getFrom()[0].toString())
+                .isEqualTo("protocolo@osasco.sp.gov.br");
+    }
+
+    @Test
+    void deveIncluirONomeDeExibicaoQuandoConfigurado() throws Exception {
+        when(accountPool.acquire()).thenReturn(Optional.of(new MailAccount(
+                "conta-a", javaMailSender, 30, "protocolo@osasco.sp.gov.br", "Prefeitura de Osasco")));
+        var enviada = ArgumentCaptor.forClass(MimeMessage.class);
+
+        gateway.send(MESSAGE);
+
+        verify(javaMailSender).send(enviada.capture());
+        assertThat(enviada.getValue().getFrom()[0].toString())
+                .contains("Prefeitura de Osasco")
+                .contains("protocolo@osasco.sp.gov.br");
     }
 
     @Test

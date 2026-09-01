@@ -1,5 +1,6 @@
 package br.com.js.mailsender.domain.model;
 
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 public record Email(String value) {
@@ -9,7 +10,8 @@ public record Email(String value) {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException("Email cannot be empty");
         }
-        var normalizado = value.trim().toLowerCase();
+        // Locale.ROOT: em tr-TR o 'I' viraria 'i' sem ponto e o endereco quebraria
+        var normalizado = value.trim().toLowerCase(Locale.ROOT);
         if (!EMAIL_PATTERN.matcher(normalizado).matches()) {
             throw new IllegalArgumentException("Invalid email: " + value);
         }

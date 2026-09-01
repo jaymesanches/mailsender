@@ -1,29 +1,36 @@
-# Pipeline: um unico `mvnw package` roda os 118 testes unitarios e produz o jar; o
-# job de imagem consome esse jar como artifact. A aplicacao e compilada UMA vez no
-# pipeline — a imagem nao compila (ver Dockerfile).
+# Pipeline: um unico `mvnw package` roda os testes unitarios e produz o jar; o job de
+# imagem consome esse jar como artifact. A aplicacao e compilada UMA vez no pipeline —
+# a imagem nao compila (ver Dockerfile).
 #
-# Os 12 testes @Tag("integration") NAO rodam por padrao: exigem Postgres, e o
-# surefire ja os exclui via test.excludedGroups no pom. Para liga-los, veja o job
-# test:integration no fim deste arquivo.
+# Os testes @Tag("integration") NAO rodam por padrao: exigem Postgres, e o surefire ja
+# os exclui via test.excludedGroups no pom. Para liga-los, veja test:integration.
 #
-# O deploy nao esta aqui: acontece no servidor com compose.deploy.yaml, usando a tag
-# imutavel :$CI_COMMIT_SHORT_SHA em MAILSENDER_IMAGE.
+# O deploy nao esta aqui: acontece no servidor com compose.deploy.yaml.
 
 stages:
   - package
-  - image
+  - publish
 
 variables:
   # repo local dentro do workspace: e a unica forma de o cache do GitLab persistir
   MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository -Djava.awt.headless=true"
   MAVEN_CLI_OPTS: "-B -ntp"
 
+  # registry:2 avulso na mesma maquina do GitLab, sem autenticacao — nao e o
+  # Container Registry do GitLab, entao $CI_REGISTRY_* nao serve aqui e nao ha login
+  IMAGE_NAME: "10.117.2.204:5000/mailsender"
+
 # ---------------- package ----------------
 
-# Compila, roda a suite unitaria e empacota, tudo numa invocacao. Nao depende de
-# infraestrutura, entao roda em qualquer executor de runner.
+# Compila, roda a suite unitaria e empacota, tudo numa invocacao.
+#
+# O `image:` sobrescreve a imagem default do runner: os runners deste GitLab sobem com
+# Java 17 e 21, e o projeto exige 25.
 package:
   stage: package
+  # Os runners deste GitLab nao aceitam job sem tag, e a tag e o nome do runner.
+  tags:
+    - java-runner
   image: eclipse-temurin:25-jdk
   cache:
     key:
@@ -41,63 +48,67 @@ package:
     reports:
       junit: target/surefire-reports/TEST-*.xml
 
-# ---------------- image ----------------
+# ---------------- publish ----------------
 
-image:
-  stage: image
+# NAO renomeie este job para `image`: e keyword global do GitLab CI, e o parser passa a
+# ler o mapa do job como nome de imagem ("image name should be a string").
+publish:image:
+  stage: publish
+
+  # Obrigatorio: so o docker-runner monta /var/run/docker.sock. Nos outros o
+  # `docker build` falha com "Cannot connect to the Docker daemon".
+  tags:
+    - docker-runner
+
+  # SEM servico dind: com o socket montado a CLI fala direto com o daemon do host.
+  # DinD exigiria privileged=true, e os tres runners estao com privileged=false.
+  # Quem precisa de `insecure-registries` para 10.117.2.204:5000 e o daemon do HOST.
+  #
+  # Se der erro de versao de API, troque por `docker:stable` — e a imagem que os
+  # outros projetos deste GitLab usam neste mesmo runner.
   image: docker:27-cli
-  services:
-    - docker:27-dind
-  variables:
-    DOCKER_TLS_CERTDIR: "/certs"
+
   # traz o jar do job anterior; sem isso o COPY do Dockerfile falha
   needs:
     - job: package
       artifacts: true
-  before_script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   script:
-    - if ! ls target/*.jar >/dev/null 2>&1; then echo "jar ausente: o artifact do job package nao chegou"; exit 1; fi
-    # Sem --cache-from o DinD comeca do zero; com o jar pronto o build e curto, mas
-    # as camadas de dependencia (~77MB) so sao reaproveitadas se a :latest vier antes.
-    - docker pull "$CI_REGISTRY_IMAGE:latest" || true
+    - 'if ! ls target/*.jar >/dev/null 2>&1; then echo "jar ausente - o artifact do job package nao chegou"; exit 1; fi'
+    # Com socket binding o cache de imagens do host persiste entre jobs, entao o build
+    # tende a ser rapido. O pull ainda ajuda na primeira execucao num host novo.
+    - docker pull "$IMAGE_NAME:latest" || true
     - >
       docker build
-      --cache-from "$CI_REGISTRY_IMAGE:latest"
-      --tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+      --cache-from "$IMAGE_NAME:latest"
+      --tag "$IMAGE_NAME:latest"
+      --tag "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
       .
-    # tag imutavel primeiro: e a que permite rollback por commit
-    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
-    - |
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
-        docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
-      fi
-    - |
-      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
-        docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
-        docker push "$CI_REGISTRY_IMAGE:latest"
-      fi
+    # :latest e o que o compose do servidor consome
+    - docker push "$IMAGE_NAME:latest"
+    # a tag do commit vai junto de graca (mesma imagem, so outro nome) e e o unico
+    # caminho de volta se a :latest quebrar — sem ela nao existe rollback
+    - docker push "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 # ---------------- integracao (opcional) ----------------
 
-# Desligado por padrao. Para ligar, defina RUN_INTEGRATION_TESTS=true nas variaveis
-# do projeto ou do pipeline.
+# Desligado por padrao. Para ligar, defina RUN_INTEGRATION_TESTS=true nas variaveis do
+# projeto ou do pipeline.
 #
-# Exige runner de executor **docker** ou **kubernetes**: e o GitLab que sobe o
-# postgres:17-alpine descartavel abaixo, nao um Postgres instalado no servidor. Em
-# executor shell o bloco `services` e ignorado sem aviso e o job falha na conexao.
+# Os runners sao de executor docker, entao o `services` abaixo funciona: e o GitLab que
+# sobe o postgres:17-alpine descartavel, nao um Postgres instalado no servidor.
 #
-# Ligar tambem recompila a aplicacao (segundo compile do pipeline) — e o preco de
-# manter este job separado do `package`, que precisa rodar sem infraestrutura.
+# Ligar recompila a aplicacao (segundo compile do pipeline) — e o preco de manter este
+# job separado do `package`, que precisa rodar sem infraestrutura.
 #
-# Vale o custo por um motivo alem dos testes: as migrations V1..V5 sao aplicadas num
-# banco vazio, validando o caminho de instalacao limpa.
+# Vale o custo por um motivo alem dos testes: as migrations sao aplicadas num banco
+# vazio, validando o caminho de instalacao limpa.
 test:integration:
   stage: package
+  tags:
+    - java-runner
   image: eclipse-temurin:25-jdk
   cache:
     key:
@@ -112,9 +123,8 @@ test:integration:
     POSTGRES_DB: mailsender_db
     POSTGRES_USER: mailsender
     POSTGRES_PASSWORD: mailsender
-    # application-test.properties aponta para localhost, que nao existe aqui: o
-    # servico atende no alias `postgres`. Variavel de ambiente tem precedencia
-    # sobre o arquivo de properties, entao basta sobrescrever a URL.
+    # application-test.properties aponta para localhost, que nao existe aqui: o servico
+    # atende no alias `postgres`. Variavel de ambiente tem precedencia sobre o arquivo.
     SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres:5432/mailsender_db"
   script:
     - ./mvnw $MAVEN_CLI_OPTS test -Dtest.excludedGroups= -Dgroups=integration

@@ -1,6 +1,7 @@
 package br.com.js.mailsender.infrastructure.mail;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
 import org.springframework.stereotype.Component;
@@ -34,11 +35,14 @@ public class MailAccountPool {
     private final AtomicInteger proxima = new AtomicInteger();
 
     public MailAccountPool(MailSenderProperties properties, SendRateLimiter rateLimiter,
-            JavaMailSender autoconfigured) {
+            JavaMailSender autoconfigured,
+            @Value("${spring.mail.username:}") String defaultFrom) {
         this.rateLimiter = rateLimiter;
         this.accounts = properties.getAccounts().isEmpty()
-                ? List.of(new MailAccount("default", autoconfigured, Integer.MAX_VALUE))
+                ? List.of(new MailAccount("default", autoconfigured, Integer.MAX_VALUE, defaultFrom, null))
                 : properties.getAccounts().stream().map(MailAccountPool::toAccount).toList();
+
+        avisarSobreRemetenteAusente();
 
         log.info("Pool de envio com {} conta(s): {}", accounts.size(), accounts.stream().map(MailAccount::name).toList());
         avisarSobreLimiteEmMemoria(rateLimiter);
@@ -89,6 +93,30 @@ public class MailAccountPool {
         // por ultimo: escape hatch para o que o tipado nao modela
         config.getProperties().forEach(props::setProperty);
 
-        return new MailAccount(config.getName(), sender, config.getMaxPerMinute());
+        // from vazio cai no username: no Exchange a caixa envia como ela mesma
+        var from = (config.getFrom() == null || config.getFrom().isBlank())
+                ? config.getUsername()
+                : config.getFrom();
+
+        return new MailAccount(config.getName(), sender, config.getMaxPerMinute(),
+                from, config.getFromName());
+    }
+
+    /**
+     * Sem remetente o JavaMail inventa um a partir do usuario do SO (algo como
+     * usuario@host), e o Exchange recusa com "SendAsDenied". Falha silenciosa no boot
+     * e visivel so no primeiro envio, entao avisa aqui.
+     */
+    private void avisarSobreRemetenteAusente() {
+        var semRemetente = accounts.stream()
+                .filter(conta -> conta.from() == null || conta.from().isBlank())
+                .map(MailAccount::name)
+                .toList();
+
+        if (!semRemetente.isEmpty()) {
+            log.warn("Conta(s) sem remetente definido: {}. O JavaMail vai inventar um endereco "
+                    + "a partir do usuario do SO e o provedor tende a recusar com SendAsDenied. "
+                    + "Defina `from` (ou `username`) na conta.", semRemetente);
+        }
     }
 }

@@ -27,12 +27,15 @@ spring:
   mail:
     host: ${MAIL_HOST}
     port: ${MAIL_PORT}
+    username: ${MAIL_USERNAME}
+    password: ${MAIL_PASSWORD}
     properties:
       mail:
         smtp:
           auth: ${MAIL_SMTP_AUTH}
           starttls:
             enable: ${MAIL_SMTP_STARTTLS}
+
   datasource:
     url: ${SPRING_DATASOURCE_URL}
     driverClassName: ${SPRING_DATASOURCE_DRIVER_CLASS_NAME}
@@ -76,12 +79,15 @@ mailsender:
       username: u_75468a9d
       password: p_fe025a623ed5c6b9
       max-per-minute: 30
-    - name: mailhog - interno
-      host: 10.117.2.204
-      port: 1025
-      username: protocolo@mailhog.com
-      password:
+    - name: office365 - pmo
+      host: smtp.office365.com
+      port: 587
+      username: protocolo@osasco.sp.gov.br
+      password: pmo@202106
       max-per-minute: 30
-      # MailHog interno nao pede credencial nem TLS; o default e true (Exchange)
-      auth: false
-      start-tls: false
+      auth: true
+      start-tls: true
+      # `from` vazio usa o username, que e o que o Exchange exige: a caixa
+      # autenticada so pode enviar como ela mesma. Só preencha diferente se houver
+      # permissao SendAs sobre o outro endereco.
+      # from-name: Prefeitura de Osasco

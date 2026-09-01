@@ -1,6 +1,8 @@
 package br.com.js.mailsender.domain.model;
 
 import org.junit.jupiter.api.Test;
+
+import java.util.Locale;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -41,6 +43,19 @@ class EmailTest {
         assertThatThrownBy(() -> Email.of(vazio))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Email cannot be empty");
+    }
+
+    @Test
+    void normalizacaoNaoPodeDependerDoLocaleDaJvm() {
+        var original = Locale.getDefault();
+        try {
+            // em tr-TR o 'I' de toLowerCase() vira 'i' sem ponto e o endereco quebraria
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"));
+
+            assertThat(Email.of("IVAN@EXAMPLE.COM").value()).isEqualTo("ivan@example.com");
+        } finally {
+            Locale.setDefault(original);
+        }
     }
 
     @Test

@@ -31,6 +31,17 @@ public class MailSenderProperties {
         private boolean auth = true;
 
         /**
+         * Endereco do remetente. Vazio usa o `username`, que e o correto para Exchange:
+         * uma caixa so pode enviar como ela mesma. Preencha diferente apenas quando
+         * houver permissao SendAs sobre outro endereco — senao o servidor recusa com
+         * "SendAsDenied".
+         */
+        private String from;
+
+        /** Nome de exibicao opcional: "Prefeitura de Osasco <protocolo@...>". */
+        private String fromName;
+
+        /**
          * Propriedades JavaMail cruas, aplicadas por ultimo — sobrescrevem inclusive os
          * timeouts padrao e o auth/startTls acima. Chave com ponto exige colchetes no
          * YAML: {@code properties: { "[mail.smtp.timeout]": 7000 }}.

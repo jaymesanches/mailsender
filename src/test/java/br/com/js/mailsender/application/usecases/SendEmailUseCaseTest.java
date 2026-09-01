@@ -110,7 +110,7 @@ class SendEmailUseCaseTest {
 
         assertThatThrownBy(() -> useCase.execute(request))
                 .isInstanceOf(AttachmentTooLargeException.class)
-                .hasMessageContaining("20,0 MB");
+                .hasMessageContaining("20.0 MB");
 
         // nao pode nem ler os bytes so para descartar
         verify(grande, never()).getBytes();
